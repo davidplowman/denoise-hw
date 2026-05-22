@@ -1,0 +1,26 @@
+Unet #1
+
+Ch	Scales	Convs	Params	MACs	RF	PSNR	SSIM	Comments
+		fdfddf
+
+32	1,2,2,2		96K	?	?	34.855	0.8977	mse
+
+32	1,2,2		66K	?	86	34.629	0.8960	mse
+
+32	1,2		35K	?	42	34.067	0.8847	mse
+
+32	1		5.4K	1.3K	18	33.235	0.8752	Worse, quite blobby
+
+24	1,2,2		38K	?	86	34.485	0.8972
+
+24	1,1		21K	5.6K	34	33.668	0.8870	Pretty good; a bit blobbier
+
+24	1,2		21K	4.0K	42	33.914	0.8888
+24	1,2	fddddf	12K	1.8K	42	33.712	0.8849	Pretty good; a bit blobbier
+24	1,2	ddfddf	15K	3.5K	42	32.957	0.8551	Worse
+24	1,2	fdfddd	20K	3.9K	42	33.606	0.8793  Not bad
+
+24	1		3.6K	882	18	32.647	0.8614	Quite a bit worse, but mostly blobs?
+
+16	1,2,2		18K	2.3K	86	33.799	0.8851
+16	1,2,2	fddddf	10K	1.1K	86	33.606	0.8815
