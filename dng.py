@@ -142,23 +142,34 @@ class DNG:
     # Public API
     # ------------------------------------------------------------------
 
-    def to_rgb(self, bayer: np.ndarray | None = None) -> np.ndarray:
+    def to_rgb(self, bayer: np.ndarray | None = None, *,
+               subtract_black_level: bool = True,
+               apply_colour_gains: bool = True) -> np.ndarray:
         """Convert (optionally pre-processed) Bayer data to an RGB image.
 
         Args:
             bayer: Optional uint16 Bayer array to use instead of the
                    original raw data.  Must have the same shape as
                    :attr:`bayer`.
+            subtract_black_level: If False, skip black-level subtraction
+                   (sets rawpy's user_black to 0).
+            apply_colour_gains: If False, skip white-balance gains
+                   (uses neutral 1:1:1:1 multipliers).
 
         Returns:
             uint8 RGB image array of shape (H, W, 3).
         """
         if bayer is None:
             bayer = self.bayer
+        wb_kwargs = (
+            {"use_camera_wb": True}
+            if apply_colour_gains
+            else {"use_camera_wb": False, "user_wb": [1.0, 1.0, 1.0, 1.0]}
+        )
+        bl_kwargs = {} if subtract_black_level else {"user_black": 0}
         with rawpy.imread(self.path) as raw:
-            if bayer is not None:
-                raw.raw_image_visible[:] = bayer
-            return raw.postprocess(use_camera_wb=True)
+            raw.raw_image_visible[:] = bayer
+            return raw.postprocess(**wb_kwargs, **bl_kwargs)
 
     # ------------------------------------------------------------------
     # Private helpers

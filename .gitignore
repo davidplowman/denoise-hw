@@ -1,0 +1,7 @@
+__pycache__
+.claude
+cache
+checkpoints
+output
+venv
+*~

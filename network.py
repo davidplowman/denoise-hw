@@ -44,29 +44,32 @@ class DenoiseNet(nn.Module):
     (residual added to the 4 input pixel channels).
     """
 
-    _SCALING_FACTORS = [1, 2, 2]
+    _SCALING_FACTORS = [1, 2, 1]
     _BASE_CH = 16
 
-    def __init__(self) -> None:
+    def __init__(self, ch: int | None = None, scaling_factors: list[int] | None = None) -> None:
         super().__init__()
-        nf = self._BASE_CH
-        in_ch = [5] + [nf] * (len(self._SCALING_FACTORS) - 1)
+        nf = ch if ch is not None else self._BASE_CH
+        sf = scaling_factors if scaling_factors is not None else list(self._SCALING_FACTORS)
+        self.ch = nf
+        self.scaling_factors = sf
+        in_ch = [5] + [nf] * (len(sf) - 1)
 
         self.enc_skip = nn.ModuleList()
         self.enc_c1   = nn.ModuleList()
-        for i, stride in enumerate(self._SCALING_FACTORS):
+        for i, stride in enumerate(sf):
             self.enc_skip.append(nn.Conv2d(in_ch[i], nf, 3, stride=stride, padding=1))
             #self.enc_skip.append(_ds_conv(in_ch[i], nf, stride=stride))
             self.enc_c1.append(_ds_conv(nf, nf))
 
         self.dec_skip = nn.ModuleList()
         self.dec_c1   = nn.ModuleList()
-        for _ in range(len(self._SCALING_FACTORS) - 1):
+        for _ in range(len(sf) - 1):
             #self.dec_skip.append(nn.Conv2d(nf * 2, nf, 3, padding=1))
             self.dec_skip.append(_ds_conv(nf * 2, nf))
             self.dec_c1.append(_ds_conv(nf, nf))
 
-        self.out_c1 = _ds_conv(nf, nf, stride=self._SCALING_FACTORS[0])
+        self.out_c1 = _ds_conv(nf, nf, stride=sf[0])
         self.out_c2 = nn.Conv2d(nf, 4, 3, padding=1)
         #self.out_c2 = _ds_conv(nf, 4)
 
@@ -74,7 +77,7 @@ class DenoiseNet(nn.Module):
         skips = []
         feat = x
 
-        for i in range(len(self._SCALING_FACTORS)):
+        for i in range(len(self.scaling_factors)):
             x_skip = F.relu(self.enc_skip[i](feat))
             out    = F.relu(self.enc_c1[i](x_skip))
             feat   = x_skip + out

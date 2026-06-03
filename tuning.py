@@ -36,6 +36,13 @@ class NoiseModel:
 
 
 @dataclass
+class CdnParams:
+    """Colour Denoise (CDN) parameters from the tuning file."""
+    deviation: float
+    strength: float
+
+
+@dataclass
 class SdnParams:
     """Spatial Denoise (SDN) parameters from the tuning file."""
     deviation: float
@@ -49,6 +56,7 @@ class SdnParams:
 class DenoiseMode:
     """Denoise parameters for a single operating mode (normal / hdr / night)."""
     sdn: SdnParams
+    cdn: CdnParams | None
 
 
 class Tuning:
@@ -181,6 +189,7 @@ class Tuning:
             if mode_name not in d:
                 continue
             sdn = d[mode_name]["sdn"]
+            cdn_raw = d[mode_name].get("cdn")
             modes[mode_name] = DenoiseMode(
                 sdn=SdnParams(
                     deviation=float(sdn["deviation"]),
@@ -188,7 +197,11 @@ class Tuning:
                     deviation2=float(sdn["deviation2"]),
                     deviation_no_tdn=float(sdn["deviation_no_tdn"]),
                     strength_no_tdn=float(sdn["strength_no_tdn"]),
-                )
+                ),
+                cdn=CdnParams(
+                    deviation=float(cdn_raw["deviation"]),
+                    strength=float(cdn_raw["strength"]),
+                ) if cdn_raw is not None else None,
             )
         return modes
 

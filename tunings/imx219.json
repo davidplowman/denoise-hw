@@ -28,7 +28,7 @@
             "rpi.noise":
             {
                 "reference_constant": 0,
-                "reference_slope": 3.661
+                "reference_slope": 5.38
             }
         },
         {

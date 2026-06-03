@@ -123,10 +123,12 @@ def main() -> None:
     parser.add_argument("--resume",       default=None, metavar="WEIGHTS")
     parser.add_argument("--lr",           type=float, default=1e-3)
     parser.add_argument("--lr-min",       type=float, default=1e-5)
-    parser.add_argument("--lr-patience",  type=int,   default=4)
+    parser.add_argument("--lr-patience",  type=int,   default=5)
     parser.add_argument("--batch-size",   type=int,   default=16)
-    parser.add_argument("--epochs",       type=int,   default=250)
+    parser.add_argument("--epochs",       type=int,   default=300)
     parser.add_argument("--no-pbar",      action="store_true")
+    parser.add_argument("--ch",      type=int,       default=None)
+    parser.add_argument("--scaling", nargs="+", type=int, default=None)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -146,14 +148,26 @@ def main() -> None:
     val_loader   = DataLoader(val_ds,   batch_size=args.batch_size,
                               shuffle=False, num_workers=4, pin_memory=True)
 
-    model = DenoiseNet().to(device)
+    state_dict = None
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device)
+        if isinstance(ckpt, dict) and "state_dict" in ckpt:
+            if args.ch is None:
+                args.ch = ckpt.get("ch")
+            if args.scaling is None:
+                args.scaling = ckpt.get("scaling_factors")
+            state_dict = ckpt["state_dict"]
+        else:
+            state_dict = ckpt
+
+    model = DenoiseNet(ch=args.ch, scaling_factors=args.scaling).to(device)
+    if state_dict is not None:
+        model.load_state_dict(state_dict)
+        print(f"Resumed from {args.resume}")
     n_params = sum(p.numel() for p in model.parameters())
     macs = _macs_per_pixel(model)
     rf = _receptive_field(model)
     print(f"Model parameters: {n_params:,}  MACs/pixel: {macs:,}  RF: {rf}×{rf}px")
-    if args.resume:
-        model.load_state_dict(torch.load(args.resume, map_location=device))
-        print(f"Resumed from {args.resume}")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = ReduceLROnPlateau(
@@ -190,7 +204,10 @@ def main() -> None:
         improved = val_loss < best_val
         if improved:
             best_val = val_loss
-            torch.save(model.state_dict(), "checkpoints/best.pth")
+            torch.save(
+                {"state_dict": model.state_dict(), "ch": model.ch, "scaling_factors": model.scaling_factors},
+                "checkpoints/best.pth",
+            )
         tag = f"  -> improved: {val_loss:.5f}" if improved else ""
         print(f"Epoch {epoch}  train {train_loss:.5f}  val {val_loss:.5f}  lr {lr:.2e}  {elapsed}s{tag}")
 
