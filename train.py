@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import math
 import time
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+from pytorch_msssim import ssim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -108,10 +110,10 @@ def _loss(
         pred, gt_ch:    (B, 4, H/2, W/2) normalised Bayer channel tensors.
         channel_gains:  (B, 4) per-channel WB gains.
     """
-    gains    = channel_gains.view(-1, 4, 1, 1)
-    pred_wb  = torch.clamp(pred  * gains, 0.0, 1.0) ** (1 / 2.2)
-    gt_wb    = torch.clamp(gt_ch * gains, 0.0, 1.0) ** (1 / 2.2)
-    return 1000 * F.l1_loss(pred_wb, gt_wb)
+    gains   = channel_gains.view(-1, 4, 1, 1)
+    pred_wb = torch.clamp(pred  * gains, 0.0, 1.0) ** (1 / 2.2)
+    gt_wb   = torch.clamp(gt_ch * gains, 0.0, 1.0) ** (1 / 2.2)
+    return 100.0 * ((1.0 - ssim(pred_wb, gt_wb, data_range=1.0)) + 6 * F.l1_loss(pred_wb, gt_wb))
 
 
 def main() -> None:
@@ -190,6 +192,13 @@ def main() -> None:
             optimizer.step()
             train_loss += loss.item()
         train_loss /= len(train_loader)
+
+        if math.isnan(train_loss):
+            print(f"Epoch {epoch}  NaN loss — resetting model to random state.")
+            model.apply(lambda m: m.reset_parameters() if hasattr(m, 'reset_parameters') else None)
+            optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+            scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=args.lr_patience)
+            continue
 
         model.eval()
         val_loss = 0.0
