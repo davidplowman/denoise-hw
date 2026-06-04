@@ -26,7 +26,7 @@ def _receptive_field(model: DenoiseNet, h: int = 128) -> int:
     each Bayer-split pixel corresponds to a 2×2 region in the original image.
     """
     device = next(model.parameters()).device
-    x = torch.zeros(1, 5, h, h, device=device, requires_grad=True)
+    x = torch.rand(1, 5, h, h, device=device, requires_grad=True)
     was_training = model.training
     model.eval()
     with torch.enable_grad():
@@ -131,6 +131,7 @@ def main() -> None:
     parser.add_argument("--no-pbar",      action="store_true")
     parser.add_argument("--ch",      type=int,       default=None)
     parser.add_argument("--scaling", nargs="+", type=int, default=None)
+    parser.add_argument("--nb",      type=int,       default=None)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -158,11 +159,13 @@ def main() -> None:
                 args.ch = ckpt.get("ch")
             if args.scaling is None:
                 args.scaling = ckpt.get("scaling_factors")
+            if args.nb is None:
+                args.nb = ckpt.get("nb")
             state_dict = ckpt["state_dict"]
         else:
             state_dict = ckpt
 
-    model = DenoiseNet(ch=args.ch, scaling_factors=args.scaling).to(device)
+    model = DenoiseNet(ch=args.ch, scaling_factors=args.scaling, nb=args.nb).to(device)
     if state_dict is not None:
         model.load_state_dict(state_dict)
         print(f"Resumed from {args.resume}")
@@ -189,6 +192,7 @@ def main() -> None:
             optimizer.zero_grad()
             loss = _loss(model(x), gt_ch, cg)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             train_loss += loss.item()
         train_loss /= len(train_loader)
@@ -214,7 +218,7 @@ def main() -> None:
         if improved:
             best_val = val_loss
             torch.save(
-                {"state_dict": model.state_dict(), "ch": model.ch, "scaling_factors": model.scaling_factors},
+                {"state_dict": model.state_dict(), "ch": model.ch, "scaling_factors": model.scaling_factors, "nb": model.nb},
                 "checkpoints/best.pth",
             )
         tag = f"  -> improved: {val_loss:.5f}" if improved else ""
