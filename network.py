@@ -34,7 +34,8 @@ class NAFBlock(nn.Module):
         self.norm1 = nn.LayerNorm(c)
         self.conv1 = nn.Conv2d(c, 2 * c, 1)
         self.dw    = nn.Conv2d(2 * c, 2 * c, 3, padding=1, groups=2 * c)
-        self.sca   = nn.Sequential(nn.AvgPool2d(7, stride=1, padding=3), nn.Conv2d(c, c, 1, bias=False))
+        #self.sca   = nn.Sequential(nn.AvgPool2d(7, stride=1, padding=3), nn.Conv2d(c, c, 1, bias=False))
+        self.sca = nn.Parameter(torch.ones(1, c, 1, 1))
         self.conv2 = nn.Conv2d(c, c, 1)
         self.norm2 = nn.LayerNorm(c)
         self.conv3 = nn.Conv2d(c, 2 * c, 1)
@@ -45,7 +46,8 @@ class NAFBlock(nn.Module):
         x = self.dw(self.conv1(x))
         x1, x2 = x.chunk(2, dim=1)
         x = x1 * x2                    # SimpleGate
-        x = x * self.sca(x)            # Simplified Channel Attention
+        #x = x * self.sca(x)            # Simplified Channel Attention
+        x = x * self.sca
         x = self.conv2(x) + inp
 
         y = self.norm2(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
@@ -86,6 +88,10 @@ class DenoiseNet(nn.Module):
         self.nb = nb
 
         self.inp = nn.Conv2d(5, nf, 3, padding=1)
+        #self.inp = nn.Sequential(
+        #    nn.Conv2d(5, 5, 3, padding=1, groups=5),
+        #    nn.Conv2d(5, nf, 1),
+        #)
 
         self.enc_blocks = nn.ModuleList(
             [NAFBlock(nf) for _ in sf[:-1]]
@@ -93,6 +99,10 @@ class DenoiseNet(nn.Module):
         )
         self.downs = nn.ModuleList([
             nn.Conv2d(nf, nf, 2, stride=2) if s > 1 else nn.Identity()
+            #nn.Sequential(
+            #    nn.Conv2d(nf, nf, 2, stride=2, groups=nf),
+            #    nn.Conv2d(nf, nf, 1),
+            #) if s > 1 else nn.Identity()
             for s in sf
         ])
 
@@ -101,6 +111,10 @@ class DenoiseNet(nn.Module):
         self.dec_blocks = nn.ModuleList([NAFBlock(nf) for _ in range(n_dec)])
 
         self.out = nn.Conv2d(nf, 4, 3, padding=1)
+        #self.out = nn.Sequential(
+        #    nn.Conv2d(nf, nf, 3, padding=1, groups=nf),
+        #    nn.Conv2d(nf, 4, 1),
+        #)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         feat = self.inp(x)

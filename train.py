@@ -114,6 +114,7 @@ def _loss(
     pred_wb = torch.clamp(pred  * gains, 0.0, 1.0) ** (1 / 2.2)
     gt_wb   = torch.clamp(gt_ch * gains, 0.0, 1.0) ** (1 / 2.2)
     return 100.0 * ((1.0 - ssim(pred_wb, gt_wb, data_range=1.0)) + 6 * F.l1_loss(pred_wb, gt_wb))
+    #return 1000.0 * F.l1_loss(pred_wb, gt_wb)
 
 
 def main() -> None:
@@ -181,6 +182,7 @@ def main() -> None:
     )
     Path("checkpoints").mkdir(exist_ok=True)
     best_val = float("inf")
+    consecutive_nans = 0
 
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
@@ -198,11 +200,17 @@ def main() -> None:
         train_loss /= len(train_loader)
 
         if math.isnan(train_loss):
-            print(f"Epoch {epoch}  NaN loss — resetting model to random state.")
+            consecutive_nans += 1
+            if consecutive_nans >= 10:
+                print(f"Epoch {epoch}  NaN loss — {consecutive_nans} in a row, quitting.")
+                break
+            print(f"Epoch {epoch}  NaN loss ({consecutive_nans}/10) — resetting model to random state.")
             model.apply(lambda m: m.reset_parameters() if hasattr(m, 'reset_parameters') else None)
             optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
             scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=args.lr_patience)
             continue
+
+        consecutive_nans = 0
 
         model.eval()
         val_loss = 0.0
