@@ -69,7 +69,7 @@ def main() -> None:
     parser.add_argument("folder", help="Path relative to PI_RAW/Data (e.g. cabinet_H_2/imx219_ag1_test)")
     parser.add_argument("--weights", required=True, metavar="PTH")
     parser.add_argument("--output",  default="output", metavar="DIR")
-    parser.add_argument("--dataset", default="/home/davidp/denoise/datasets/PI_RAW", metavar="ROOT")
+    parser.add_argument("--dataset", default="/opt/datasets/PI_RAW", metavar="ROOT")
     parser.add_argument("--quick", action="store_true")
     args = parser.parse_args()
 

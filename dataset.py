@@ -252,7 +252,7 @@ def main() -> None:
     build_p.add_argument("--patch-size", type=int, default=256, metavar="N")
     build_p.add_argument(
         "--dataset",
-        default="/home/davidp/denoise/datasets/PI_RAW",
+        default="/opt/datasets/PI_RAW",
         metavar="ROOT",
     )
     build_p.add_argument("--filter", nargs="*", default=None, metavar="KEYWORD")
