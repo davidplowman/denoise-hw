@@ -10,7 +10,6 @@ from pathlib import Path
 import numpy as np
 from scipy.ndimage import convolve
 
-from denoise_hw import DenoiseHW
 from dng import DNG
 from folders import find_folders
 
@@ -20,19 +19,8 @@ _LAP = np.array([[0, -1, 0], [-1, 4, -1], [0, -1, 0]], dtype=np.float32)
 @dataclass
 class ImageRecord:
     path: str
-    cached_path: str
     top_left: tuple[int, int]  # (y, x) in Bayer coords
     detail: float
-
-
-def _cache_filename(folder: Path, cache_dir: Path) -> Path:
-    parts = folder.parts
-    idx = next(
-        (i for i in range(1, len(parts)) if parts[i] == "Data" and parts[i - 1] == "PI_RAW"),
-        None,
-    )
-    suffix = "_".join(parts[idx + 1:]) if idx is not None else "_".join(parts[-2:])
-    return cache_dir / f"{suffix}.npy"
 
 
 def _patch_detail(patch: np.ndarray) -> float:
@@ -62,18 +50,12 @@ def _cmd_build(args: argparse.Namespace) -> None:
         print(f"Processing {folder_str}...")
         dng = DNG(str(folder / "noisy.dng"))
 
-        cached = _cache_filename(folder, cache_dir)
-        if not cached.exists():
-            denoised = DenoiseHW(dng, factor=1.0).process(dng.bayer)
-            np.save(str(cached), denoised)
-
         H, W = dng.bayer.shape
         for r0 in range(0, H - ps + 1, ps):
             for c0 in range(0, W - ps + 1, ps):
                 patch = dng.bayer[r0:r0 + ps, c0:c0 + ps]
                 records.append(ImageRecord(
                     path=folder_str,
-                    cached_path=str(cached),
                     top_left=(r0, c0),
                     detail=_patch_detail(patch),
                 ))
@@ -118,10 +100,7 @@ def _cmd_show(args: argparse.Namespace) -> None:
     folder = folder_records[0].path
 
     dng = DNG(str(Path(folder) / "noisy.dng"))
-    if args.denoised:
-        rgb = dng.to_rgb(bayer=np.load(folder_records[0].cached_path))
-    else:
-        rgb = dng.to_rgb()
+    rgb = dng.to_rgb()
     sy = rgb.shape[0] / dng.bayer.shape[0]
     sx = rgb.shape[1] / dng.bayer.shape[1]
 
@@ -177,7 +156,6 @@ class PatchDataset:
         return {
             "noisy":         imgs["noisy"]   [r0:r0+p,    c0:c0+p   ].astype(np.float32),
             "gt":            imgs["gt"]      [r0:r0+p,    c0:c0+p   ].astype(np.float32),
-            "denoised":      imgs["denoised"][r0:r0+p,    c0:c0+p   ].astype(np.float32),
             "std":           imgs["std_map"] [ph:ph+ph2,  pw:pw+ph2 ],
             "channel_gains": imgs["channel_gains"],
             "white_level":   imgs["white_level"],
@@ -249,7 +227,6 @@ def load_datasets(
             images[rec.path] = {
                 "noisy":         noisy_dng.bayer,
                 "gt":            gt_dng.bayer,
-                "denoised":      np.load(rec.cached_path),
                 "std_map":       std_map,
                 "channel_gains": channel_gains,
                 "white_level":   np.int32(noisy_dng.white_level),
@@ -285,7 +262,6 @@ def main() -> None:
 
     show_p = sub.add_parser("show", help="Visualise patches on an RGB image.")
     show_p.add_argument("--key", required=True, metavar="PATH")
-    show_p.add_argument("--denoised", action="store_true")
     show_p.add_argument("--name", default="show.jpg", metavar="FILE")
     show_p.add_argument("--cache", default="cache", metavar="DIR")
 
