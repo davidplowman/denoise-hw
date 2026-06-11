@@ -175,7 +175,7 @@ def main() -> None:
     rf = _receptive_field(model)
     print(f"Model parameters: {n_params:,}  MACs/pixel: {macs:,}  RF: {rf}×{rf}px")
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5,
         patience=args.lr_patience,
@@ -204,9 +204,9 @@ def main() -> None:
             if consecutive_nans >= 10:
                 print(f"Epoch {epoch}  NaN loss — {consecutive_nans} in a row, quitting.")
                 break
-            print(f"Epoch {epoch}  NaN loss ({consecutive_nans}/10) — resetting model to random state.")
-            model.apply(lambda m: m.reset_parameters() if hasattr(m, 'reset_parameters') else None)
-            optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+            print(f"Epoch {epoch}  NaN loss ({consecutive_nans}/10) — recreating model.")
+            model = DenoiseNet(ch=args.ch, scaling_factors=args.scaling, nb=args.nb).to(device)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
             scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=args.lr_patience)
             continue
 

@@ -30,3 +30,5 @@ run_training() {
 
 run_training 16 "2 2 1" 2
 run_training 20 "2 2" 2
+run_training 16 "2 2" 2
+run_training 32 "2 2 2 1" 4
