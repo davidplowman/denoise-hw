@@ -59,8 +59,8 @@ class NAFBlock(nn.Module):
 class DenoiseNet(nn.Module):
     """NAFNet denoiser operating on Bayer-split pixel values.
 
-    Input to forward(): (B, 5, H/2, W/2) — 4 Bayer channels + 1 noise-std
-    channel, normalised to [0, 1] by white_level.
+    Input to forward(): (B, 4, H/2, W/2) — 4 Bayer channels,
+    normalised to [0, 1] by white_level.
 
     Output of forward(): (B, 4, H/2, W/2) — denoised Bayer channels
     (residual added to the 4 input pixel channels).
@@ -87,10 +87,10 @@ class DenoiseNet(nn.Module):
         self.scaling_factors = sf
         self.nb = nb
 
-        self.inp = nn.Conv2d(5, nf, 3, padding=1)
+        self.inp = nn.Conv2d(4, nf, 3, padding=1)
         #self.inp = nn.Sequential(
-        #    nn.Conv2d(5, 5, 3, padding=1, groups=5),
-        #    nn.Conv2d(5, nf, 1),
+        #    nn.Conv2d(4, 4, 3, padding=1, groups=4),
+        #    nn.Conv2d(4, nf, 1),
         #)
 
         self.enc_blocks = nn.ModuleList(

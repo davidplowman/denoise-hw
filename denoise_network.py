@@ -55,19 +55,9 @@ class DenoiseNetwork(DenoiseHW):
         """
         img = bayer.astype(np.float32)
 
-        avg = (img[0::2, 0::2] + img[0::2, 1::2] +
-               img[1::2, 0::2] + img[1::2, 1::2]) / 4
-
-        avg_bl = np.maximum(avg - self.black_level, 0)
-        std_ds = (self.noise_calibration[0]
-                  + self.noise_calibration[1] * np.sqrt(avg_bl)
-                  + self.noise_calibration[2] * avg_bl)
-        std_ds = np.maximum(std_ds, 1.0)
-
         ch = np.stack([img[0::2, 0::2], img[0::2, 1::2],
                        img[1::2, 0::2], img[1::2, 1::2]], axis=0)
-        net_in = np.concatenate([ch, std_ds[np.newaxis]], axis=0)
-        x = torch.from_numpy(net_in / self.white_level).unsqueeze(0).float()
+        x = torch.from_numpy(ch / self.white_level).unsqueeze(0).float()
 
         with torch.no_grad():
             out = self.model(x)

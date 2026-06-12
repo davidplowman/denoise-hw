@@ -151,12 +151,10 @@ class PatchDataset:
         rec = self._records[idx]
         r0, c0 = rec.top_left
         p = self._patch_size
-        ph, pw, ph2 = r0 // 2, c0 // 2, p // 2
         imgs = self._images[rec.path]
         return {
-            "noisy":         imgs["noisy"]   [r0:r0+p,    c0:c0+p   ].astype(np.float32),
-            "gt":            imgs["gt"]      [r0:r0+p,    c0:c0+p   ].astype(np.float32),
-            "std":           imgs["std_map"] [ph:ph+ph2,  pw:pw+ph2 ],
+            "noisy":         imgs["noisy"]   [r0:r0+p, c0:c0+p].astype(np.float32),
+            "gt":            imgs["gt"]      [r0:r0+p, c0:c0+p].astype(np.float32),
             "channel_gains": imgs["channel_gains"],
             "white_level":   imgs["white_level"],
         }
@@ -208,16 +206,6 @@ def load_datasets(
             noisy_dng = DNG(str(Path(rec.path) / "noisy.dng"))
             gt_dng = DNG(str(Path(rec.path) / "gt.dng"))
 
-            img_f = noisy_dng.bayer.astype(np.float32)
-            avg = (img_f[0::2, 0::2] + img_f[0::2, 1::2] +
-                   img_f[1::2, 0::2] + img_f[1::2, 1::2]) / 4
-            noise_cal = noisy_dng.tuning.get_noise2_calibration(noisy_dng.gain)
-            avg_bl = np.maximum(avg - noisy_dng.black_level, 0.0)
-            std_map = np.maximum(
-                noise_cal[0] + noise_cal[1] * np.sqrt(avg_bl) + noise_cal[2] * avg_bl,
-                1.0,
-            ).astype(np.float32)
-
             _cidx = {'R': 0, 'G': 1, 'B': 2}
             channel_gains = np.array(
                 [noisy_dng.wb_gains[_cidx[noisy_dng.bayer_pattern[i]]] for i in range(4)],
@@ -227,7 +215,6 @@ def load_datasets(
             images[rec.path] = {
                 "noisy":         noisy_dng.bayer,
                 "gt":            gt_dng.bayer,
-                "std_map":       std_map,
                 "channel_gains": channel_gains,
                 "white_level":   np.int32(noisy_dng.white_level),
             }

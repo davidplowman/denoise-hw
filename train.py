@@ -26,7 +26,7 @@ def _receptive_field(model: DenoiseNet, h: int = 128) -> int:
     each Bayer-split pixel corresponds to a 2×2 region in the original image.
     """
     device = next(model.parameters()).device
-    x = torch.rand(1, 5, h, h, device=device, requires_grad=True)
+    x = torch.rand(1, 4, h, h, device=device, requires_grad=True)
     was_training = model.training
     model.eval()
     with torch.enable_grad():
@@ -60,7 +60,7 @@ def _macs_per_pixel(model: DenoiseNet, patch_size: int = 256) -> int:
     device = next(model.parameters()).device
     h = patch_size // 2
     with torch.no_grad():
-        model(torch.zeros(1, 5, h, h, device=device))
+        model(torch.zeros(1, 4, h, h, device=device))
     for hnd in handles:
         hnd.remove()
     return total // (patch_size * patch_size)
@@ -82,18 +82,15 @@ def _prepare_input(
     """Build network input and targets from a dataset batch.
 
     Returns:
-        x:       (B, 5, H/2, W/2) normalised input (4 Bayer channels + std)
+        x:       (B, 4, H/2, W/2) normalised input (4 Bayer channels)
         gt_ch:   (B, 4, H/2, W/2) normalised ground-truth channels
         cg:      (B, 4) per-channel WB gains
     """
     wl = batch["white_level"].float().to(device).view(-1, 1, 1, 1)
     noisy = batch["noisy"].to(device)
     gt    = batch["gt"].to(device)
-    std   = batch["std"].to(device).unsqueeze(1)
 
-    ch    = _split(noisy) / wl
-    std   = std / wl
-    x     = torch.cat([ch, std], dim=1)
+    x     = _split(noisy) / wl
     gt_ch = _split(gt) / wl
     cg    = batch["channel_gains"].to(device)
     return x, gt_ch, cg
