@@ -69,9 +69,9 @@ class DenoiseNet(nn.Module):
     for that encoder level (1 = same resolution, 2 = downsample ×2).
     """
 
-    _SCALING_FACTORS = [1, 2, 1]
+    _SCALING_FACTORS = [2, 2, 1]
     _BASE_CH = 16
-    _NB = 1
+    _NB = 2
 
     def __init__(
         self,
