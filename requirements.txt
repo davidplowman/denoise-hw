@@ -1,0 +1,11 @@
+ExifRead==3.5.1
+numpy==2.2.6
+Pillow==12.2.0
+pytorch-msssim==1.0.0
+rawpy==0.27.0
+scikit-image==0.25.2
+scipy==1.15.3
+torch==2.12.1
+torchinfo==1.8.0
+torchvision==0.27.1
+tqdm==4.68.3
