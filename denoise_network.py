@@ -29,17 +29,17 @@ class DenoiseNetwork(DenoiseHW):
         weights_file: str | None = None,
     ) -> None:
         super().__init__(dng, factor=factor)
-        ch, scaling_factors, nb, state_dict = None, None, None, None
+        ch, scaling_factors, num_encoders, state_dict = None, None, None, None
         if weights_file is not None:
             ckpt = torch.load(weights_file, map_location="cpu")
             if isinstance(ckpt, dict) and "state_dict" in ckpt:
                 ch              = ckpt.get("ch")
                 scaling_factors = ckpt.get("scaling_factors")
-                nb              = ckpt.get("nb")
+                num_encoders    = ckpt.get("num_encoders")
                 state_dict      = ckpt["state_dict"]
             else:
                 state_dict = ckpt
-        self.model = DenoiseNet(ch=ch, scaling_factors=scaling_factors, nb=nb)
+        self.model = DenoiseNet(ch=ch, scaling_factors=scaling_factors, num_encoders=num_encoders)
         if state_dict is not None:
             self.model.load_state_dict(state_dict)
         self.model.eval()

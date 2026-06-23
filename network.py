@@ -71,21 +71,22 @@ class DenoiseNet(nn.Module):
 
     _SCALING_FACTORS = [2, 2, 1]
     _BASE_CH = 16
-    _NB = 2
+    _NUM_ENCODERS = [1, 1, 2]
 
     def __init__(
         self,
         ch: int | None = None,
         scaling_factors: list[int] | None = None,
-        nb: int | None = None,
+        num_encoders: list[int] | None = None,
     ) -> None:
         super().__init__()
         nf = ch if ch is not None else self._BASE_CH
         sf = scaling_factors if scaling_factors is not None else list(self._SCALING_FACTORS)
-        nb = nb if nb is not None else self._NB
+        num_encoders = num_encoders if num_encoders is not None else list(self._NUM_ENCODERS)
+        assert len(num_encoders) == len(sf), "num_encoders must have one entry per scaling level"
         self.ch = nf
         self.scaling_factors = sf
-        self.nb = nb
+        self.num_encoders = num_encoders
 
         self.inp = nn.Conv2d(4, nf, 3, padding=1)
         #self.inp = nn.Sequential(
@@ -93,10 +94,9 @@ class DenoiseNet(nn.Module):
         #    nn.Conv2d(4, nf, 1),
         #)
 
-        self.enc_blocks = nn.ModuleList(
-            [NAFBlock(nf) for _ in sf[:-1]]
-            + [nn.Sequential(*[NAFBlock(nf) for _ in range(nb)])]
-        )
+        self.enc_blocks = nn.ModuleList([
+            nn.Sequential(*[NAFBlock(nf) for _ in range(n)]) for n in num_encoders
+        ])
         self.downs = nn.ModuleList([
             nn.Conv2d(nf, nf, 2, stride=2) if s > 1 else nn.Identity()
             #nn.Sequential(

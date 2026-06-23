@@ -84,7 +84,7 @@ def main() -> None:
     gt_dng    = DNG(str(folder / "gt.dng"))
 
     dn       = DenoiseNetwork(noisy_dng, factor=1.0, weights_file=args.weights)
-    print(f"Model: ch={dn.model.ch}  scaling={dn.model.scaling_factors}  nb={dn.model.nb}")
+    print(f"Model: ch={dn.model.ch}  scaling={dn.model.scaling_factors}  encoders={dn.model.num_encoders}")
     denoised = dn.process(noisy_dng.bayer)
 
     denoised = denoised.astype(np.float32) - noisy_dng.black_level

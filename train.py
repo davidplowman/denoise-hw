@@ -129,7 +129,7 @@ def main() -> None:
     parser.add_argument("--no-pbar",      action="store_true")
     parser.add_argument("--ch",      type=int,       default=None)
     parser.add_argument("--scaling", nargs="+", type=int, default=None)
-    parser.add_argument("--nb",      type=int,       default=None)
+    parser.add_argument("--encoders", nargs="+", type=int, default=None)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -157,13 +157,13 @@ def main() -> None:
                 args.ch = ckpt.get("ch")
             if args.scaling is None:
                 args.scaling = ckpt.get("scaling_factors")
-            if args.nb is None:
-                args.nb = ckpt.get("nb")
+            if args.encoders is None:
+                args.encoders = ckpt.get("num_encoders")
             state_dict = ckpt["state_dict"]
         else:
             state_dict = ckpt
 
-    model = DenoiseNet(ch=args.ch, scaling_factors=args.scaling, nb=args.nb).to(device)
+    model = DenoiseNet(ch=args.ch, scaling_factors=args.scaling, num_encoders=args.encoders).to(device)
     if state_dict is not None:
         model.load_state_dict(state_dict)
         print(f"Resumed from {args.resume}")
@@ -202,7 +202,7 @@ def main() -> None:
                 print(f"Epoch {epoch}  NaN loss — {consecutive_nans} in a row, quitting.")
                 break
             print(f"Epoch {epoch}  NaN loss ({consecutive_nans}/10) — recreating model.")
-            model = DenoiseNet(ch=args.ch, scaling_factors=args.scaling, nb=args.nb).to(device)
+            model = DenoiseNet(ch=args.ch, scaling_factors=args.scaling, num_encoders=args.encoders).to(device)
             optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
             scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=args.lr_patience)
             continue
@@ -223,7 +223,7 @@ def main() -> None:
         if improved:
             best_val = val_loss
             torch.save(
-                {"state_dict": model.state_dict(), "ch": model.ch, "scaling_factors": model.scaling_factors, "nb": model.nb},
+                {"state_dict": model.state_dict(), "ch": model.ch, "scaling_factors": model.scaling_factors, "num_encoders": model.num_encoders},
                 "checkpoints/best.pth",
             )
         tag = f"  -> improved: {val_loss:.5f}" if improved else ""
