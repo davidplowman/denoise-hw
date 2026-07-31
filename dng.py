@@ -83,6 +83,31 @@ def _apply_geq(bayer: np.ndarray, bayer_pattern: str, geq, white_level: int) -> 
     return result
 
 
+def _apply_dpc(bayer: np.ndarray) -> np.ndarray:
+    """Defective Pixel Correction.
+
+    For each pixel in the interior of the image, its 8 same-channel
+    neighbours (at offsets of ±2 pixels in each dimension) are examined and
+    the pixel is clipped to lie within their min/max range. Border pixels,
+    for which not all 8 neighbours exist, are left unchanged.
+
+    Args:
+        bayer: uint16 raw Bayer array.
+
+    Returns:
+        A new uint16 array with defective pixel correction applied.
+    """
+    result = bayer.copy()
+    interior = bayer[2:-2, 2:-2]
+    neighbours = np.stack([
+        bayer[0:-4, 0:-4], bayer[0:-4, 2:-2], bayer[0:-4, 4:],
+        bayer[2:-2, 0:-4],                    bayer[2:-2, 4:],
+        bayer[4:,   0:-4], bayer[4:,   2:-2], bayer[4:,   4:],
+    ])
+    result[2:-2, 2:-2] = np.clip(interior, neighbours.min(axis=0), neighbours.max(axis=0))
+    return result
+
+
 def _bayer_pattern(raw: rawpy.RawPy) -> str:
     """Return the 2×2 Bayer pattern as a string, e.g. 'RGGB'."""
     desc = raw.color_desc.decode()
@@ -134,6 +159,9 @@ class DNG:
         self.exposure_time, self.iso = self._read_exif(self.path)
         self.gain: float = self.iso / 100.0
 
+        if self.path.endswith("gt.dng") and self.gain > 16:
+            self.bayer = _apply_dpc(self.bayer)
+
         if self.tuning.geq is not None:
             self.bayer = _apply_geq(self.bayer, self.bayer_pattern, self.tuning.geq, self.white_level)
 
@@ -166,7 +194,9 @@ class DNG:
             if apply_colour_gains
             else {"use_camera_wb": False, "user_wb": [1.0, 1.0, 1.0, 1.0]}
         )
-        bl_kwargs = {} if subtract_black_level else {"user_black": 0}
+        #bl_kwargs = {} if subtract_black_level else {"user_black": 0}
+        black_level = int(self.black_level) if subtract_black_level else 0
+        bl_kwargs = {"user_black": black_level}
         with rawpy.imread(self.path) as raw:
             raw.raw_image_visible[:] = bayer
             return raw.postprocess(**wb_kwargs, **bl_kwargs)

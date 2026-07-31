@@ -99,7 +99,7 @@ def _cmd_show(args: argparse.Namespace) -> None:
 
     folder = folder_records[0].path
 
-    dng = DNG(str(Path(folder) / "noisy.dng"))
+    dng = DNG(str(Path(folder) / "gt.dng"))
     rgb = dng.to_rgb()
     sy = rgb.shape[0] / dng.bayer.shape[0]
     sx = rgb.shape[1] / dng.bayer.shape[1]
