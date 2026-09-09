@@ -31,27 +31,27 @@ class NAFBlock(nn.Module):
 
     def __init__(self, c: int) -> None:
         super().__init__()
-        self.norm1 = nn.LayerNorm(c)
+        #self.norm1 = nn.LayerNorm(c)
         self.conv1 = nn.Conv2d(c, 2 * c, 1)
         self.dw    = nn.Conv2d(2 * c, 2 * c, 3, padding=1, groups=2 * c)
         #self.sca   = nn.Sequential(nn.AvgPool2d(7, stride=1, padding=3), nn.Conv2d(c, c, 1, bias=False))
         self.sca = nn.Parameter(torch.ones(1, c, 1, 1))
-        self.conv2 = nn.Conv2d(c, c, 1)
-        self.norm2 = nn.LayerNorm(c)
+        #self.conv2 = nn.Conv2d(c, c, 1)
+        #self.norm2 = nn.LayerNorm(c)
         self.conv3 = nn.Conv2d(c, 2 * c, 1)
         self.conv4 = nn.Conv2d(c, c, 1)
 
     def forward(self, inp: torch.Tensor) -> torch.Tensor:
-        x = self.norm1(inp.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        x = inp #x = self.norm1(inp.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         x = self.dw(self.conv1(x))
         x1, x2 = x.chunk(2, dim=1)
         x = x1 * x2                    # SimpleGate
         #x = x * self.sca(x)            # Simplified Channel Attention
         x = x * self.sca
-        x = self.conv2(x) + inp
+        #x = self.conv2(x) + inp
 
-        y = self.norm2(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        y = self.conv3(y)
+        #y = self.norm2(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        y = self.conv3(x + inp)
         y1, y2 = y.chunk(2, dim=1)
         return self.conv4(y1 * y2) + x  # SimpleGate + residual
 
@@ -107,7 +107,9 @@ class DenoiseNet(nn.Module):
         ])
 
         n_dec = len(sf) - 1
-        self.fuse       = nn.ModuleList([nn.Conv2d(2 * nf, nf, 1) for _ in range(n_dec)])
+        #self.fuse       = nn.ModuleList([nn.Conv2d(2 * nf, nf, 1) for _ in range(n_dec)])
+        self.skip_gain = nn.ParameterList([nn.Parameter(torch.ones(1, nf, 1, 1)) for _ in range(n_dec)])
+        self.up_gain   = nn.ParameterList([nn.Parameter(torch.ones(1, nf, 1, 1)) for _ in range(n_dec)])
         self.dec_blocks = nn.ModuleList([NAFBlock(nf) for _ in range(n_dec)])
 
         self.out = nn.Conv2d(nf, 4, 3, padding=1)
@@ -120,18 +122,22 @@ class DenoiseNet(nn.Module):
         feat = self.inp(x)
 
         skips = []
-        for enc, down in zip(self.enc_blocks, self.downs):
+        n = len(self.enc_blocks)
+        for i, (enc, down) in enumerate(zip(self.enc_blocks, self.downs)):
             feat  = enc(feat)
             skips = [feat] + skips   # LIFO: deepest first
-            feat  = down(feat)
+            if i < n - 1:             # last level's down() output is never used below
+                feat = down(feat)
 
         feat  = skips[0]
         skips = skips[1:]
 
-        for fuse, dec in zip(self.fuse, self.dec_blocks):
+        #for fuse, dec in zip(self.fuse, self.dec_blocks):
+        for skip_gain, up_gain, dec in zip(self.skip_gain, self.up_gain, self.dec_blocks):
             up    = F.interpolate(feat, size=skips[0].shape[-2:],
                                   mode='bilinear', align_corners=False)
-            feat  = dec(fuse(torch.cat([skips[0], up], dim=1)))
+            #feat  = dec(fuse(torch.cat([skips[0], up], dim=1)))
+            feat = dec(skips[0] * skip_gain + up * up_gain)
             skips = skips[1:]
 
         return x[:, :4] + self.out(feat)

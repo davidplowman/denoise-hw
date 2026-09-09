@@ -26,4 +26,4 @@ run_training() {
 
 # Example: run_training 20 "1 2 2" "1 1 2"
 
-run_training 32 "2 2 2 1" "1 2 2 1"
+run_training 20 "2 2 1" "1 1 1"
