@@ -32,6 +32,8 @@ class NAFBlock(nn.Module):
     def __init__(self, c: int) -> None:
         super().__init__()
         #self.norm1 = nn.LayerNorm(c)
+        self.norm1_gain = nn.Parameter(torch.ones(1, c, 1, 1))
+        self.norm1_eps  = 1e-6
         self.conv1 = nn.Conv2d(c, 2 * c, 1)
         self.dw    = nn.Conv2d(2 * c, 2 * c, 3, padding=1, groups=2 * c)
         #self.sca   = nn.Sequential(nn.AvgPool2d(7, stride=1, padding=3), nn.Conv2d(c, c, 1, bias=False))
@@ -42,7 +44,14 @@ class NAFBlock(nn.Module):
         self.conv4 = nn.Conv2d(c, c, 1)
 
     def forward(self, inp: torch.Tensor) -> torch.Tensor:
-        x = inp #x = self.norm1(inp.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        #x = self.norm1(inp.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        # RMSNorm, channels-first: no permute, no mean-subtraction pass --
+        # cheaper than LayerNorm but still a data-dependent rescale (unlike
+        # a plain learned per-channel scale), so it keeps LayerNorm's role
+        # of capping activation growth across blocks and preventing the
+        # occasional NaN from clamp(pred, 0, 1) ** (1/2.2) hitting x=0.
+        rms = inp.pow(2).mean(dim=1, keepdim=True).add(self.norm1_eps).sqrt()
+        x = inp / rms * self.norm1_gain
         x = self.dw(self.conv1(x))
         x1, x2 = x.chunk(2, dim=1)
         x = x1 * x2                    # SimpleGate
@@ -90,8 +99,8 @@ class DenoiseNet(nn.Module):
 
         self.inp = nn.Conv2d(4, nf, 3, padding=1)
         #self.inp = nn.Sequential(
-        #    nn.Conv2d(4, 4, 3, padding=1, groups=4),
         #    nn.Conv2d(4, nf, 1),
+        #    nn.Conv2d(nf, nf, 3, padding=1, groups=nf),
         #)
 
         self.enc_blocks = nn.ModuleList([

@@ -108,8 +108,9 @@ def _loss(
         channel_gains:  (B, 4) per-channel WB gains.
     """
     gains   = channel_gains.view(-1, 4, 1, 1)
-    pred_wb = torch.clamp(pred  * gains, 0.0, 1.0) ** (1 / 2.2)
-    gt_wb   = torch.clamp(gt_ch * gains, 0.0, 1.0) ** (1 / 2.2)
+    eps = 1e-6
+    pred_wb = (torch.clamp(pred  * gains, 0.0, 1.0) + eps) ** (1 / 2.2)
+    gt_wb   = (torch.clamp(gt_ch * gains, 0.0, 1.0) + eps) ** (1 / 2.2)
     return 100.0 * ((1.0 - ssim(pred_wb, gt_wb, data_range=1.0)) + 6 * F.l1_loss(pred_wb, gt_wb))
     #return 1000.0 * F.l1_loss(pred_wb, gt_wb)
 
@@ -201,8 +202,15 @@ def main() -> None:
             if consecutive_nans >= 10:
                 print(f"Epoch {epoch}  NaN loss — {consecutive_nans} in a row, quitting.")
                 break
-            print(f"Epoch {epoch}  NaN loss ({consecutive_nans}/10) — recreating model.")
             model = DenoiseNet(ch=args.ch, scaling_factors=args.scaling, num_encoders=args.encoders).to(device)
+            if best_val < float("inf"):
+                ckpt = torch.load("checkpoints/best.pth", map_location=device)
+                model.load_state_dict(ckpt["state_dict"])
+                print(f"Epoch {epoch}  NaN loss ({consecutive_nans}/10) — "
+                      f"reloaded checkpoints/best.pth (val {best_val:.5f}) and recreated optimizer.")
+            else:
+                print(f"Epoch {epoch}  NaN loss ({consecutive_nans}/10) — "
+                      f"no checkpoint yet, recreating model from scratch.")
             optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
             scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=args.lr_patience)
             continue

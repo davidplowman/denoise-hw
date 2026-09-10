@@ -19,11 +19,11 @@ run_training() {
         echo "***********************************************************************"
         python train.py --cache cache_imx662 --ch "$ch" --scaling $scaling --encoders $encoders --no-pbar
         python test.py cabinet_D50_1/imx662_ag128_test0 --dataset /opt/datasets/IMX662 --weights checkpoints/best.pth --quick
-        mv checkpoints/best.pth "checkpoints/run_${tag}_${i}.pth"
+        cp checkpoints/best.pth "checkpoints/run_${tag}_${i}.pth"
     done
     } > >(tee "run_${tag}.txt") 2>&1
 }
 
 # Example: run_training 20 "1 2 2" "1 1 2"
 
-run_training 20 "2 2 1" "1 1 1"
+run_training 16 "2 2 1" "1 1 1"
