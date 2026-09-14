@@ -27,42 +27,51 @@ def bayer_merge(x: torch.Tensor) -> torch.Tensor:
 
 
 class NAFBlock(nn.Module):
-    """NAFNet block: LayerNorm + SimpleGate + SCA, no nonlinear activations."""
+    """NAFNet-style block: mean-|x| norm + ReLU + SCA.
+
+    SimpleGate (a GLU-style multiplicative gate) needed two same-width
+    branches -- conv1a/conv1b+dw_a/dw_b, conv3a/conv3b -- purely to have two
+    things to multiply together. A plain activation doesn't need that: one
+    branch + ReLU replaces each gated pair, which removes both the gate's
+    BinaryOp multiply (real measured cost) and the second branch's convs
+    entirely, not just the multiply.
+
+    Normalisation divides by the per-pixel mean of |x| across channels
+    rather than RMS (sqrt(mean(x^2))) -- same channel-mean machinery (a
+    fixed 1x1 conv, not .mean(dim=1), for the groups-generalises-cleanly
+    reason noted below), but one fewer UnaryOp per block since there's no
+    sqrt. A learned gain can absorb the resulting constant scale difference
+    from RMS, though it's a different statistic (L1 vs L2), not just a
+    cheaper way to compute the same one -- worth checking training responds
+    fine to it, same as the ReLU swap. Not mathematically equivalent to what
+    this replaces -- needs retraining.
+    """
 
     def __init__(self, c: int) -> None:
         super().__init__()
-        #self.norm1 = nn.LayerNorm(c)
+        # Per-pixel channel mean, expressed as a fixed 1x1 conv: every output
+        # channel = mean of the c input channels. A plain (non-learned)
+        # buffer, not a Parameter -- there's nothing to train.
+        self.register_buffer("mean_kernel", torch.full((c, c, 1, 1), 1.0 / c))
         self.norm1_gain = nn.Parameter(torch.ones(1, c, 1, 1))
         self.norm1_eps  = 1e-6
-        self.conv1 = nn.Conv2d(c, 2 * c, 1)
-        self.dw    = nn.Conv2d(2 * c, 2 * c, 3, padding=1, groups=2 * c)
-        #self.sca   = nn.Sequential(nn.AvgPool2d(7, stride=1, padding=3), nn.Conv2d(c, c, 1, bias=False))
+
+        self.conv1 = nn.Conv2d(c, c, 1)
+        self.dw    = nn.Conv2d(c, c, 3, padding=1, groups=c)
         self.sca = nn.Parameter(torch.ones(1, c, 1, 1))
-        #self.conv2 = nn.Conv2d(c, c, 1)
-        #self.norm2 = nn.LayerNorm(c)
-        self.conv3 = nn.Conv2d(c, 2 * c, 1)
+        self.conv3 = nn.Conv2d(c, c, 1)
         self.conv4 = nn.Conv2d(c, c, 1)
 
     def forward(self, inp: torch.Tensor) -> torch.Tensor:
-        #x = self.norm1(inp.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        # RMSNorm, channels-first: no permute, no mean-subtraction pass --
-        # cheaper than LayerNorm but still a data-dependent rescale (unlike
-        # a plain learned per-channel scale), so it keeps LayerNorm's role
-        # of capping activation growth across blocks and preventing the
-        # occasional NaN from clamp(pred, 0, 1) ** (1/2.2) hitting x=0.
-        rms = inp.pow(2).mean(dim=1, keepdim=True).add(self.norm1_eps).sqrt()
-        x = inp / rms * self.norm1_gain
-        x = self.dw(self.conv1(x))
-        x1, x2 = x.chunk(2, dim=1)
-        x = x1 * x2                    # SimpleGate
-        #x = x * self.sca(x)            # Simplified Channel Attention
-        x = x * self.sca
-        #x = self.conv2(x) + inp
+        mabs = F.conv2d(inp.abs(), self.mean_kernel)   # mean of |inp| over channels, per pixel
+        scale = mabs.add(self.norm1_eps)               # no sqrt -- one fewer UnaryOp than RMS
+        x = inp / scale * self.norm1_gain
 
-        #y = self.norm2(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        y = self.conv3(x + inp)
-        y1, y2 = y.chunk(2, dim=1)
-        return self.conv4(y1 * y2) + x  # SimpleGate + residual
+        x = F.gelu(self.dw(self.conv1(x)))
+        x = x * self.sca
+
+        y = F.relu(self.conv3(x + inp))
+        return self.conv4(y) + x  # residual
 
 
 class DenoiseNet(nn.Module):

@@ -17,8 +17,47 @@ The default --width/--height/--channels (968x552x4) match denoise_ncnn.cpp's
 network; pass different values for a network with a different input shape
 (e.g. --channels 9 for model_denoise's imx662_ncnn network -- though that one
 uses custom layers this script's plain ncnn.Net can't load at all).
+
+--processes N profiles N fully independent ncnn instances running
+concurrently (separate OS processes, each with its own loaded net and its
+own --threads), reporting one aggregate ms/call figure across all of them --
+i.e. throughput under real concurrent load, not per-instance latency. Each
+worker is a genuinely separate process (this script re-invoked via
+subprocess), not a fork()ed child of an already-import-numpy/ncnn-initialised
+parent -- forking after OpenMP has initialised in the parent is a known
+deadlock hazard (that's what multiprocessing's default 'fork' start method
+would do here), which subprocess's fork+exec avoids since exec() replaces
+the process image outright.
+
+Each worker signals readiness once its model is loaded and warmup is done,
+and the parent releases all of them together, so every worker's *timed*
+loop starts at roughly the same moment. The aggregate figure is computed
+from those synchronized timed loops alone -- process startup, imports,
+model load and --warmup are excluded -- so it reflects genuine concurrent
+throughput regardless of --loops (unlike naively timing from process launch
+to exit, where that fixed per-process overhead would dominate at low
+--loops and understate throughput).
+
+--thread-instances N is the single-process analogue of --processes: it
+loads N fully independent ncnn::Net instances (each with its own --threads
+worker threads) and runs them concurrently as Python threads of this one
+process, rather than as separate OS processes. Unlike passing a plain
+--threads N (which hands one shared instance's *internal* OpenMP threading
+more workers -- often with diminishing returns), each --thread-instances
+worker has its own net, its own extractor and its own timed loop, so this
+measures genuine independent throughput -- as long as ncnn's C++ inference
+releases the GIL while it runs, in which case the Python threads really do
+overlap. All N instances warm up, then synchronize on a threading.Barrier
+before their timed loops start, mirroring --processes' readiness handshake
+so the aggregate figure reflects the synchronized concurrent phase alone.
+Mutually exclusive with --processes.
 """
 import argparse
+import json
+import os
+import subprocess
+import sys
+import threading
 import time
 
 import ncnn
@@ -196,7 +235,7 @@ def analyse_param_file(path, in_w, in_h, in_c):
     return num_params, num_macs, out_w, out_h, bool(unhandled), unhandled
 
 
-def main():
+def build_parser():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("name", help="network name, excluding .param/.bin")
@@ -204,14 +243,33 @@ def main():
     parser.add_argument("--height", type=int, default=552, help="input height (default: 552)")
     parser.add_argument("--channels", type=int, default=4, help="input channels (default: 4)")
     parser.add_argument("--threads", type=int, default=ncnn.get_cpu_count(),
-                         help="ncnn worker threads (default: all cores)")
+                         help="ncnn worker threads, per process (default: all cores)")
     parser.add_argument("--warmup", type=int, default=3, help="warm-up runs, discarded (default: 3)")
     parser.add_argument("--loops", type=int, default=10, help="timed runs to average (default: 10)")
     parser.add_argument("--fp32", action="store_true", help="disable fp16 storage/arithmetic")
     parser.add_argument("--input", help="input blob name (default: autodetect)")
     parser.add_argument("--output", help="output blob name (default: autodetect)")
-    args = parser.parse_args()
+    parser.add_argument("--processes", type=int, default=1,
+                         help="run this many independent ncnn instances concurrently, in "
+                              "separate processes, and report aggregate ms/call across all "
+                              "of them (default: 1, i.e. the normal single-instance report)")
+    parser.add_argument("--thread-instances", type=int, default=1, dest="thread_instances",
+                         help="run this many independent ncnn instances concurrently, as "
+                              "Python threads of this single process, and report aggregate "
+                              "ms/call across all of them (default: 1; mutually exclusive "
+                              "with --processes)")
+    # Internal: re-invoked by --processes to run one worker. Not for direct use.
+    parser.add_argument("--_worker", action="store_true", help=argparse.SUPPRESS)
+    return parser
 
+
+def run_inference(args, pre_loop_hook=None):
+    """Load the network and run warmup + timed loops. Returns (times_ms,
+    last output Mat, input_name, output_name).
+
+    If given, pre_loop_hook() is called once after warmup and before the
+    timed loop starts -- used by worker_main() to synchronize concurrent
+    workers so their timed loops begin together."""
     net = ncnn.Net()
     net.opt.num_threads = args.threads
     net.opt.use_vulkan_compute = False
@@ -231,11 +289,6 @@ def main():
     arr = in_mat.numpy()
     arr[...] = np.random.default_rng().random(arr.shape, dtype=np.float32)
 
-    print(f"Network:  {args.name}")
-    print(f"Input:    '{input_name}' {args.width}x{args.height}x{args.channels}")
-    print(f"Output:   '{output_name}'")
-    print(f"Threads:  {args.threads}   fp16: {not args.fp32}")
-
     def run_once():
         ex = net.create_extractor()
         ex.input(input_name, in_mat)
@@ -247,6 +300,9 @@ def main():
     for _ in range(args.warmup):
         run_once()
 
+    if pre_loop_hook:
+        pre_loop_hook()
+
     times_ms = []
     out = None
     for _ in range(args.loops):
@@ -254,14 +310,10 @@ def main():
         out = run_once()
         times_ms.append((time.perf_counter() - t0) * 1000.0)
 
-    times_ms.sort()
-    print(f"Output:   {out.w}x{out.h}x{out.c} (elempack={out.elempack})")
-    print(f"\n{args.loops} runs, ms: "
-          f"min={times_ms[0]:.2f} "
-          f"median={times_ms[len(times_ms) // 2]:.2f} "
-          f"max={times_ms[-1]:.2f} "
-          f"mean={sum(times_ms) / len(times_ms):.2f}")
+    return times_ms, out, input_name, output_name
 
+
+def print_param_macs_report(args):
     try:
         num_params, num_macs, out_w, out_h, approx, unhandled = analyse_param_file(
             args.name + ".param", args.width, args.height, args.channels)
@@ -274,6 +326,211 @@ def main():
             print(f"MACs/output pixel: unknown (couldn't determine output size){note}")
     except Exception as e:
         print(f"\n(could not estimate parameters/MACs: {e})")
+
+
+def _wait_for_release():
+    """Signal readiness to the parent (once model load + warmup are done)
+    and block until it releases every worker together, so timed loops
+    across concurrent workers start at roughly the same moment."""
+    print("__READY__", flush=True)
+    sys.stdin.readline()
+
+
+def worker_main(args):
+    """Child process entry point (--_worker): run the timed loop and print
+    nothing but a single JSON line of per-run ms times, for the parent to
+    collect. Before the timed loop, synchronizes with the parent via
+    _wait_for_release() -- see that function and multi_main()."""
+    times_ms, _, _, _ = run_inference(args, pre_loop_hook=_wait_for_release)
+    print(json.dumps(times_ms))
+
+
+def single_main(args):
+    times_ms, out, input_name, output_name = run_inference(args)
+
+    print(f"Network:  {args.name}")
+    print(f"Input:    '{input_name}' {args.width}x{args.height}x{args.channels}")
+    print(f"Output:   '{output_name}'")
+    print(f"Threads:  {args.threads}   fp16: {not args.fp32}")
+    print(f"Output:   {out.w}x{out.h}x{out.c} (elempack={out.elempack})")
+
+    times_ms = sorted(times_ms)
+    print(f"\n{args.loops} runs, ms: "
+          f"min={times_ms[0]:.2f} "
+          f"median={times_ms[len(times_ms) // 2]:.2f} "
+          f"max={times_ms[-1]:.2f} "
+          f"mean={sum(times_ms) / len(times_ms):.2f}")
+
+    print_param_macs_report(args)
+
+
+def worker_command(args):
+    cmd = [sys.executable, os.path.abspath(__file__), args.name,
+           "--width", str(args.width), "--height", str(args.height),
+           "--channels", str(args.channels), "--threads", str(args.threads),
+           "--warmup", str(args.warmup), "--loops", str(args.loops)]
+    if args.fp32:
+        cmd.append("--fp32")
+    if args.input:
+        cmd += ["--input", args.input]
+    if args.output:
+        cmd += ["--output", args.output]
+    cmd.append("--_worker")
+    return cmd
+
+
+def multi_main(args):
+    print(f"Network:   {args.name}")
+    print(f"Input:     {args.width}x{args.height}x{args.channels}")
+    print(f"Processes: {args.processes} (each threads={args.threads}, fp16={not args.fp32})")
+    print(f"Per process: {args.warmup} warmup + {args.loops} timed runs")
+
+    cmd = worker_command(args)
+    t0 = time.perf_counter()
+    procs = [subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True)
+             for _ in range(args.processes)]
+
+    # Wait for every worker to finish loading + warmup (see _wait_for_release()),
+    # then release them all together so their timed loops start in sync. A
+    # worker that dies before signalling just hits EOF here rather than
+    # hanging -- its failure is reported below via returncode.
+    for p in procs:
+        while True:
+            line = p.stdout.readline()
+            if line == "" or line.strip() == "__READY__":
+                break
+    for p in procs:
+        if p.stdin:
+            try:
+                p.stdin.write("GO\n")
+                p.stdin.flush()
+            except OSError:
+                pass  # worker already gone; its failure shows up via returncode
+
+    results = [p.communicate() for p in procs]
+    wall_s = time.perf_counter() - t0
+
+    all_times = []
+    for i, (proc, (stdout, stderr)) in enumerate(zip(procs, results)):
+        if proc.returncode != 0:
+            print(f"  process {i}: FAILED (exit {proc.returncode}): {stderr.strip()[-300:]}")
+            continue
+        try:
+            all_times.append(json.loads(stdout.strip().splitlines()[-1]))
+        except Exception as e:
+            print(f"  process {i}: could not parse output ({e}): {stdout!r}")
+
+    ok = len(all_times)
+    if ok < args.processes:
+        print(f"\n{args.processes - ok}/{args.processes} worker process(es) failed -- "
+              f"aggregate below only reflects the {ok} that succeeded")
+
+    total_calls = sum(len(t) for t in all_times)
+    # Each worker's timed loop is sequential, so sum(times) is that worker's
+    # own timed-loop duration. All timed loops started together (the
+    # readiness handshake above), so the slowest one bounds how long the
+    # synchronized concurrent phase actually took -- unlike wall_s, this
+    # excludes per-process startup/model-load/warmup entirely.
+    concurrent_s = max((sum(t) / 1000.0 for t in all_times), default=0.0)
+    print(f"\n{ok} concurrent processes completed, {total_calls} total calls, "
+          f"startup+load+warmup+timed wall={wall_s * 1000:.1f}ms")
+    if total_calls and concurrent_s > 0:
+        print(f"Aggregate throughput: {concurrent_s * 1000 / total_calls:.2f} ms/call "
+              f"(= {total_calls / concurrent_s:.1f} calls/s across all {ok} processes)")
+    for i, times in enumerate(all_times):
+        times = sorted(times)
+        print(f"  process {i}: mean={sum(times) / len(times):.2f}ms "
+              f"min={times[0]:.2f} max={times[-1]:.2f}")
+
+    print_param_macs_report(args)
+
+
+def thread_main(args):
+    n = args.thread_instances
+    print(f"Network:  {args.name}")
+    print(f"Input:    {args.width}x{args.height}x{args.channels}")
+    print(f"Threads:  {n} concurrent ncnn instances in this process "
+          f"(each threads={args.threads}, fp16={not args.fp32})")
+    print(f"Per instance: {args.warmup} warmup + {args.loops} timed runs")
+
+    # Mirrors multi_main()'s readiness handshake, but with a Barrier instead
+    # of a pipe: every instance loads its model and runs warmup, then blocks
+    # on the barrier, so all N timed loops start together. If any instance
+    # raises before reaching the barrier (e.g. a model load failure), it
+    # aborts the barrier so the others don't hang forever waiting for it.
+    barrier = threading.Barrier(n)
+    results = [None] * n
+    errors = [None] * n
+
+    def run_one(i):
+        try:
+            times_ms, _, _, _ = run_inference(args, pre_loop_hook=barrier.wait)
+            results[i] = times_ms
+        except Exception as e:
+            errors[i] = e
+            try:
+                barrier.abort()
+            except threading.BrokenBarrierError:
+                pass
+
+    threads = [threading.Thread(target=run_one, args=(i,)) for i in range(n)]
+    t0 = time.perf_counter()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    wall_s = time.perf_counter() - t0
+
+    all_times = []
+    for i in range(n):
+        if errors[i] is not None:
+            print(f"  instance {i}: FAILED: {errors[i]}")
+        elif results[i] is not None:
+            all_times.append(results[i])
+
+    ok = len(all_times)
+    if ok < n:
+        print(f"\n{n - ok}/{n} thread instance(s) failed -- "
+              f"aggregate below only reflects the {ok} that succeeded")
+
+    total_calls = sum(len(t) for t in all_times)
+    # As in multi_main(): each instance's timed loop is sequential, so
+    # sum(times) is that instance's own timed-loop duration, and since all
+    # timed loops started together (the barrier above), the slowest one
+    # bounds how long the synchronized concurrent phase actually took.
+    concurrent_s = max((sum(t) / 1000.0 for t in all_times), default=0.0)
+    print(f"\n{ok} concurrent thread instances completed, {total_calls} total calls, "
+          f"load+warmup+timed wall={wall_s * 1000:.1f}ms")
+    if total_calls and concurrent_s > 0:
+        print(f"Aggregate throughput: {concurrent_s * 1000 / total_calls:.2f} ms/call "
+              f"(= {total_calls / concurrent_s:.1f} calls/s across all {ok} instances)")
+    for i, times in enumerate(all_times):
+        times = sorted(times)
+        print(f"  instance {i}: mean={sum(times) / len(times):.2f}ms "
+              f"min={times[0]:.2f} max={times[-1]:.2f}")
+
+    print_param_macs_report(args)
+
+
+def main():
+    args = build_parser().parse_args()
+
+    if args.processes > 1 and args.thread_instances > 1:
+        raise SystemExit("--processes and --thread-instances are mutually exclusive")
+
+    if args._worker:
+        worker_main(args)
+        return
+
+    print(f"processes={args.processes}  threads={args.threads}  thread-instances={args.thread_instances}")
+
+    if args.processes > 1:
+        multi_main(args)
+    elif args.thread_instances > 1:
+        thread_main(args)
+    else:
+        single_main(args)
 
 
 if __name__ == "__main__":
