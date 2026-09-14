@@ -83,13 +83,24 @@ class DenoiseNet(nn.Module):
     Output of forward(): (B, 4, H/2, W/2) — denoised Bayer channels
     (residual added to the 4 input pixel channels).
 
+    forward()'s external shape contract above is unchanged, but internally
+    the network works in a 16-channel domain at half the resolution again --
+    one more space-to-depth step of the same kind bayer_split() does to go
+    from a 1-channel Bayer image to 4 channels. Going in, that fold is
+    learned: self.inp is a stride-2 conv straight over the 4 input channels,
+    so the "fold 2x2 block into channels" and "mix across channels" steps
+    happen in one op rather than a fixed nn.PixelUnshuffle(2) followed by a
+    separate conv. Coming back out, self.out + nn.PixelShuffle(2) undoes it
+    the other way (fixed channel-to-space, not learned) right before the
+    last conv.
+
     scaling_factors controls depth and subsampling: each entry is the stride
     for that encoder level (1 = same resolution, 2 = downsample ×2).
     """
 
-    _SCALING_FACTORS = [2, 2, 1]
-    _BASE_CH = 16
-    _NUM_ENCODERS = [1, 1, 2]
+    _SCALING_FACTORS = [2, 2]
+    _BASE_CH = 32
+    _NUM_ENCODERS = [1, 1]
 
     def __init__(
         self,
@@ -106,11 +117,11 @@ class DenoiseNet(nn.Module):
         self.scaling_factors = sf
         self.num_encoders = num_encoders
 
-        self.inp = nn.Conv2d(4, nf, 3, padding=1)
-        #self.inp = nn.Sequential(
-        #    nn.Conv2d(4, nf, 1),
-        #    nn.Conv2d(nf, nf, 3, padding=1, groups=nf),
-        #)
+        # Folds each 2x2 block of the 4 Bayer channels into nf channels at
+        # half the resolution again, in one learned stride-2 conv -- see
+        # the class docstring. self.out + self.shuffle (declared below)
+        # undo this the other way on the way back out.
+        self.inp = nn.Conv2d(4, nf, 2, stride=2)
 
         self.enc_blocks = nn.ModuleList([
             nn.Sequential(*[NAFBlock(nf) for _ in range(n)]) for n in num_encoders
@@ -130,11 +141,15 @@ class DenoiseNet(nn.Module):
         self.up_gain   = nn.ParameterList([nn.Parameter(torch.ones(1, nf, 1, 1)) for _ in range(n_dec)])
         self.dec_blocks = nn.ModuleList([NAFBlock(nf) for _ in range(n_dec)])
 
-        self.out = nn.Conv2d(nf, 4, 3, padding=1)
+        self.out = nn.Conv2d(nf, 16, 3, padding=1)
         #self.out = nn.Sequential(
         #    nn.Conv2d(nf, nf, 3, padding=1, groups=nf),
-        #    nn.Conv2d(nf, 4, 1),
+        #    nn.Conv2d(nf, 16, 1),
         #)
+        # Unfolds self.out's 16 channels back to 4, at double the
+        # resolution -- the inverse of what self.inp folds together above,
+        # but fixed (unlearned) rather than learned.
+        self.shuffle = nn.PixelShuffle(2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         feat = self.inp(x)
@@ -158,4 +173,4 @@ class DenoiseNet(nn.Module):
             feat = dec(skips[0] * skip_gain + up * up_gain)
             skips = skips[1:]
 
-        return x[:, :4] + self.out(feat)
+        return x[:, :4] + self.shuffle(self.out(feat))
