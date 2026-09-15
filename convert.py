@@ -322,10 +322,13 @@ def main(argv: list[str] | None = None) -> None:
     print(f"Model parameters: {n_params:,}")
 
     # Each encoder level with a scaling factor > 1 halves the spatial size
-    # (network.py always uses a stride-2 Conv2d there). The Bayer split itself
-    # halves width/height once more before that. Sensor width/height must
-    # therefore be a multiple of 2 * (2 ** num_downsampling_levels).
-    num_downsamples = sum(1 for s in model.scaling_factors if s > 1)
+    # (nafnet.DenoiseNet always uses a stride-2 Conv2d there). A flat,
+    # non-U-Net architecture (e.g. ffdnet.DenoiseNet) has no encoder levels
+    # at all -- scaling_factors is None -- so treat that as zero downsampling
+    # levels. The Bayer split itself halves width/height once more before
+    # that. Sensor width/height must therefore be a multiple of
+    # 2 * (2 ** num_downsampling_levels).
+    num_downsamples = sum(1 for s in model.scaling_factors if s > 1) if model.scaling_factors else 0
     align = 2 * (2 ** num_downsamples)
 
     width = round_up(args.width, align)
