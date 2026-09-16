@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from mfdnet import MFA, MFDB
+
 
 def bayer_split(x: torch.Tensor) -> torch.Tensor:
     """(B, H, W) → (B, 4, H/2, W/2)."""
@@ -27,7 +29,7 @@ def bayer_merge(x: torch.Tensor) -> torch.Tensor:
 
 
 class NAFBlock(nn.Module):
-    """NAFNet-style block: mean-|x| norm + ReLU + SCA.
+    """NAFNet-style block: mean-|x| norm + ReLU + MFA.
 
     SimpleGate (a GLU-style multiplicative gate) needed two same-width
     branches -- conv1a/conv1b+dw_a/dw_b, conv3a/conv3b -- purely to have two
@@ -45,6 +47,16 @@ class NAFBlock(nn.Module):
     cheaper way to compute the same one -- worth checking training responds
     fine to it, same as the ReLU swap. Not mathematically equivalent to what
     this replaces -- needs retraining.
+
+    "SCA" (simplified channel attention, in the original NAFNet) used to be
+    a bare nn.Parameter(1, c, 1, 1) here -- a static, per-channel learned
+    gain with zero dependence on the input's content, not real attention at
+    all. Replaced with mfdnet.py's MFA gate (Haar-downsample -> small conv
+    stack -> sigmoid -> bilinear-upsample -> multiply): a genuine
+    input-dependent, spatially-varying, frequency-aware gate. Substantially
+    more expensive (roughly 1,700x the params of the sca it replaces, per
+    block) -- an experiment in trading that cost for real per-pixel
+    attention, not a free upgrade.
     """
 
     def __init__(self, c: int) -> None:
@@ -52,26 +64,35 @@ class NAFBlock(nn.Module):
         # Per-pixel channel mean, expressed as a fixed 1x1 conv: every output
         # channel = mean of the c input channels. A plain (non-learned)
         # buffer, not a Parameter -- there's nothing to train.
-        self.register_buffer("mean_kernel", torch.full((c, c, 1, 1), 1.0 / c))
-        self.norm1_gain = nn.Parameter(torch.ones(1, c, 1, 1))
-        self.norm1_eps  = 1e-6
+        #self.register_buffer("mean_kernel", torch.full((c, c, 1, 1), 1.0 / c))
+        #self.norm1_gain = nn.Parameter(torch.ones(1, c, 1, 1))
+        #self.norm1_eps  = 1e-6
 
         self.conv1 = nn.Conv2d(c, c, 1)
         self.dw    = nn.Conv2d(c, c, 3, padding=1, groups=c)
-        self.sca = nn.Parameter(torch.ones(1, c, 1, 1))
+        #self.sca = nn.Parameter(torch.ones(1, c, 1, 1))
+        self.mfa = MFA(c)
         self.conv3 = nn.Conv2d(c, c, 1)
-        self.conv4 = nn.Conv2d(c, c, 1)
+        #self.conv4 = nn.Conv2d(c, c, 1)
 
-    def forward(self, inp: torch.Tensor) -> torch.Tensor:
-        mabs = F.conv2d(inp.abs(), self.mean_kernel)   # mean of |inp| over channels, per pixel
-        scale = mabs.add(self.norm1_eps)               # no sqrt -- one fewer UnaryOp than RMS
-        x = inp / scale * self.norm1_gain
+    def forward_old(self, inp: torch.Tensor) -> torch.Tensor:
+        #mabs = F.conv2d(inp.abs(), self.mean_kernel)   # mean of |inp| over channels, per pixel
+        #scale = mabs.add(self.norm1_eps)               # no sqrt -- one fewer UnaryOp than RMS
+        #x = inp / scale * self.norm1_gain
+        x = inp
 
         x = F.gelu(self.dw(self.conv1(x)))
-        x = x * self.sca
+        #x = x * self.sca
+        x = self.mfa(x)
 
         y = F.relu(self.conv3(x + inp))
         return self.conv4(y) + x  # residual
+
+    def forward(self, inp: torch.Tensor) -> torch.Tensor:
+        x = F.gelu(self.dw(self.conv1(inp)))
+
+        x = self.conv3(x + inp)
+        return self.mfa(x)
 
 
 class DenoiseNet(nn.Module):
@@ -126,6 +147,10 @@ class DenoiseNet(nn.Module):
         self.enc_blocks = nn.ModuleList([
             nn.Sequential(*[NAFBlock(nf) for _ in range(n)]) for n in num_encoders
         ])
+        # Experiment (reverted): NAFBlock -> MFDB(1, nf) (mfdnet.py's block, just 1 RepConv per MFDB).
+        #self.enc_blocks = nn.ModuleList([
+        #    nn.Sequential(*[MFDB(1, nf) for _ in range(n)]) for n in num_encoders
+        #])
         self.downs = nn.ModuleList([
             nn.Conv2d(nf, nf, 2, stride=2) if s > 1 else nn.Identity()
             #nn.Sequential(
@@ -140,6 +165,8 @@ class DenoiseNet(nn.Module):
         self.skip_gain = nn.ParameterList([nn.Parameter(torch.ones(1, nf, 1, 1)) for _ in range(n_dec)])
         self.up_gain   = nn.ParameterList([nn.Parameter(torch.ones(1, nf, 1, 1)) for _ in range(n_dec)])
         self.dec_blocks = nn.ModuleList([NAFBlock(nf) for _ in range(n_dec)])
+        # Experiment (reverted): NAFBlock -> MFDB(1, nf), same as enc_blocks above.
+        #self.dec_blocks = nn.ModuleList([MFDB(1, nf) for _ in range(n_dec)])
 
         self.out = nn.Conv2d(nf, 16, 3, padding=1)
         #self.out = nn.Sequential(

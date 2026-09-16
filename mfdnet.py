@@ -65,17 +65,31 @@ class HaarTransform(nn.Module):
 
 
 class MFA(nn.Module):
-    """Multi-frequency attention gate: Haar-downsample, a small conv stack
-    down to a sigmoid gate, bilinear-upsample back, then scale the input by
-    that gate."""
+    """Multi-frequency attention gate: a strided-conv downsample, a small
+    conv stack down to a sigmoid gate, bilinear-upsample back, then scale
+    the input by that gate.
+
+    The reference decomposes this first downsample as an explicit
+    HaarTransform followed by a learned Conv2d -- but with no nonlinearity
+    between them, that composition is just some other (larger-kernel)
+    conv: HaarTransform is invertible per 2x2 block (a lossless change of
+    basis, not a bottleneck), so anything the pair could compute, a single
+    directly-parameterized strided conv can compute too, at the same
+    param/MAC cost. Collapsed into one Conv2d(c, c, 4, stride=2, padding=1)
+    here accordingly -- simpler code, same expressivity and cost, at the
+    loss of the explicit frequency-decomposition inductive bias (average/
+    horizontal/vertical/diagonal detail) the reference's factored form
+    provides, which may or may not matter in practice."""
 
     def __init__(self, c: int) -> None:
         super().__init__()
         self.gate = nn.Sequential(
-            HaarTransform(c),
-            nn.Conv2d(4 * c, c, 3, padding=1), nn.ReLU(inplace=True),
-            nn.Conv2d(c, c, 3, padding=1), nn.ReLU(inplace=True),
-            nn.Conv2d(c, c, 3, padding=1), nn.Sigmoid(),
+            #nn.Conv2d(c, c, 3, stride=2, padding=1), nn.ReLU(inplace=True),
+            #nn.Conv2d(c, c, 3, padding=1), nn.ReLU(inplace=True),
+            #nn.Conv2d(c, c, 1, padding=1), nn.Sigmoid(),
+
+            #nn.Conv2d(c, c, 3, stride=2, padding=1), nn.Sigmoid(),
+            nn.Conv2d(c, c, 3, stride=2, padding=1, groups=c), nn.Conv2d(c, c, 1), nn.Sigmoid()
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -96,9 +110,10 @@ class RepConv(nn.Module):
     def __init__(self, c: int) -> None:
         super().__init__()
         self.repconv = nn.Sequential(
-            nn.Conv2d(c, 2 * c, 1),
-            nn.Conv2d(2 * c, 2 * c, 3, padding=1),
-            nn.Conv2d(2 * c, c, 1),
+            #nn.Conv2d(c, 2 * c, 1),
+            #nn.Conv2d(2 * c, 2 * c, 3, padding=1),
+            #nn.Conv2d(2 * c, c, 1),
+            nn.Conv2d(c, c, 3, padding=1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
