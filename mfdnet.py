@@ -89,14 +89,14 @@ class MFA(nn.Module):
             #nn.Conv2d(c, c, 1, padding=1), nn.Sigmoid(),
 
             #nn.Conv2d(c, c, 3, stride=2, padding=1), nn.Sigmoid(),
-            nn.Conv2d(c, c, 3, stride=2, padding=1, groups=c), nn.Conv2d(c, c, 1), nn.Sigmoid()
+            nn.Conv2d(c, c, 3, padding=1, groups=c), nn.Conv2d(c, c, 1), nn.Sigmoid()
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # size=, not the reference's bare scale_factor=2 -- matches
         # nafnet.py's own F.interpolate(..., size=skips[0].shape[-2:], ...)
         # convention; not a behaviour change in our always-power-of-2 case.
-        gate = F.interpolate(self.gate(x), size=x.shape[-2:], mode='bilinear', align_corners=False)
+        gate = self.gate(x) #F.interpolate(self.gate(x), size=x.shape[-2:], mode='bilinear', align_corners=False)
         return x * gate
 
 

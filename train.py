@@ -126,7 +126,7 @@ def main() -> None:
     parser.add_argument("--lr-min",       type=float, default=1e-5)
     parser.add_argument("--lr-patience",  type=int,   default=8)
     parser.add_argument("--batch-size",   type=int,   default=16)
-    parser.add_argument("--epochs",       type=int,   default=400)
+    parser.add_argument("--epochs",       type=int,   default=450)
     parser.add_argument("--no-pbar",      action="store_true")
     parser.add_argument("--ch",      type=int,       default=None)
     parser.add_argument("--scaling", nargs="+", type=int, default=None)

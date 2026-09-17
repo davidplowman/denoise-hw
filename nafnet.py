@@ -197,7 +197,8 @@ class DenoiseNet(nn.Module):
             up    = F.interpolate(feat, size=skips[0].shape[-2:],
                                   mode='bilinear', align_corners=False)
             #feat  = dec(fuse(torch.cat([skips[0], up], dim=1)))
-            feat = dec(skips[0] * skip_gain + up * up_gain)
+            #feat = dec(skips[0] * skip_gain + up * up_gain)
+            feat = dec(skips[0] + up)
             skips = skips[1:]
 
         return x[:, :4] + self.shuffle(self.out(feat))
