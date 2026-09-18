@@ -129,9 +129,13 @@ def main() -> None:
     parser.add_argument("--epochs",       type=int,   default=450)
     parser.add_argument("--no-pbar",      action="store_true")
     parser.add_argument("--ch",      type=int,       default=None)
-    parser.add_argument("--scaling", nargs="+", type=int, default=None)
+    parser.add_argument("--scaling", type=str, default=None,
+                         help="space-separated scaling factors, e.g. \"2 2\"; "
+                              "\"\" means no downscaling at all")
     parser.add_argument("--encoders", nargs="+", type=int, default=None)
     args = parser.parse_args()
+    if args.scaling is not None:
+        args.scaling = [int(v) for v in args.scaling.split()]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")

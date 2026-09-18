@@ -69,3 +69,62 @@ class DenoiseNetwork(DenoiseHW):
         result[1::2, 0::2] = ch_out[2]
         result[1::2, 1::2] = ch_out[3]
         return np.clip(result, 0, self.white_level).astype(np.uint16)
+
+
+class NcnnDenoiseNetwork(DenoiseHW):
+    """Same interface as DenoiseNetwork, but runs a converted ncnn .param/.bin
+    pair (e.g. from convert.py --format ncnn --quantize int8) instead of the
+    PyTorch model -- for comparing a quantized export's real image quality
+    against the original checkpoint's.
+
+    Args:
+        dng: Loaded DNG image used to configure noise parameters.
+        factor: Scaling factor applied to noise_calibration coefficients.
+        param_file: Path to the ncnn .param file.
+        bin_file: Path to the ncnn .bin file.
+    """
+
+    def __init__(
+        self,
+        dng: DNG,
+        factor: float = 1.0,
+        param_file: str | None = None,
+        bin_file: str | None = None,
+    ) -> None:
+        super().__init__(dng, factor=factor)
+        import ncnn
+
+        self.net = ncnn.Net()
+        self.net.load_param(str(param_file))
+        self.net.load_model(str(bin_file))
+
+    def process(self, bayer: np.ndarray) -> np.ndarray:
+        """Denoise a raw Bayer image using the ncnn model.
+
+        Args:
+            bayer: uint16 Bayer array of shape (H, W).
+
+        Returns:
+            Denoised uint16 Bayer array of the same shape.
+        """
+        import ncnn
+
+        img = bayer.astype(np.float32)
+
+        ch = np.stack([img[0::2, 0::2], img[0::2, 1::2],
+                       img[1::2, 0::2], img[1::2, 1::2]], axis=0)
+        x = (ch / self.white_level).astype(np.float32)
+
+        ex = self.net.create_extractor()
+        ex.input(self.net.input_names()[0], ncnn.Mat(x))
+        ret, mat_out = ex.extract(self.net.output_names()[0])
+        if ret != 0:
+            raise RuntimeError(f"ncnn extraction failed (ret={ret})")
+
+        ch_out = mat_out.numpy() * self.white_level
+        result = np.empty_like(img)
+        result[0::2, 0::2] = ch_out[0]
+        result[0::2, 1::2] = ch_out[1]
+        result[1::2, 0::2] = ch_out[2]
+        result[1::2, 1::2] = ch_out[3]
+        return np.clip(result, 0, self.white_level).astype(np.uint16)

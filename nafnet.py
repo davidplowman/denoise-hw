@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 
 class DenoiseBlock(nn.Module):
-    """NAFNet-style block: mean-|x| norm + ReLU + MFA.
+    """Encoder/decoder block with simple channel attention mechanism.
     """
 
     def __init__(self, c: int) -> None:
@@ -22,13 +22,13 @@ class DenoiseBlock(nn.Module):
         )
 
     def forward(self, inp: torch.Tensor) -> torch.Tensor:
-        x = nn.gelu(self.dw(self.conv1(inp)))
+        x = F.relu(self.dw(self.conv1(inp)))
         x = self.conv2(x + inp)
         return self.gate(x) * x
 
 
 class DenoiseNet(nn.Module):
-    """NAFNet denoiser operating on Bayer-split pixel values.
+    """Unet-style denoiser operating on Bayer-split pixel values.
 
     Input to forward(): (B, 4, H/2, W/2) — 4 Bayer channels,
     normalised to [0, 1] by white_level.
@@ -36,11 +36,14 @@ class DenoiseNet(nn.Module):
     Output of forward(): (B, 4, H/2, W/2) — denoised Bayer channels
     (residual added to the 4 input pixel channels).
 
-    scaling_factors controls depth and subsampling: each entry is the stride
-    for that encoder level (1 = same resolution, 2 = downsample ×2).
+    scaling_factors controls subsampling between encoder levels: each entry
+    is the stride between one encoder level and the next (N = downsample ×N
+    via a non-overlapping NxN conv; any N works, not just 2). There is
+    always one more encoder level than there are scaling factors -- the
+    last encoder level (the bottleneck) has no downsample after it.
     """
 
-    _SCALING_FACTORS = [2, 2]
+    _SCALING_FACTORS = [2]
     _BASE_CH = 32
     _NUM_ENCODERS = [1, 1]
 
@@ -54,7 +57,8 @@ class DenoiseNet(nn.Module):
         nf = ch if ch is not None else self._BASE_CH
         sf = scaling_factors if scaling_factors is not None else list(self._SCALING_FACTORS)
         num_encoders = num_encoders if num_encoders is not None else list(self._NUM_ENCODERS)
-        assert len(num_encoders) == len(sf), "num_encoders must have one entry per scaling level"
+        assert len(num_encoders) == len(sf) + 1, \
+            "num_encoders must have one more entry than scaling_factors (the bottleneck level)"
         self.ch = nf
         self.scaling_factors = sf
         self.num_encoders = num_encoders
@@ -65,7 +69,7 @@ class DenoiseNet(nn.Module):
             nn.Sequential(*[DenoiseBlock(nf) for _ in range(n)]) for n in num_encoders
         ])
         self.downs = nn.ModuleList([
-            nn.Conv2d(nf, nf, 2, stride=2) if s > 1 else nn.Identity()
+            nn.Conv2d(nf, nf, s, stride=s) if s > 1 else nn.Identity()
             #nn.Sequential(
             #    nn.Conv2d(nf, nf, 2, stride=2, groups=nf),
             #    nn.Conv2d(nf, nf, 1),
@@ -73,7 +77,7 @@ class DenoiseNet(nn.Module):
             for s in sf
         ])
 
-        n_dec = len(sf) - 1
+        n_dec = len(sf)
         self.dec_blocks = nn.ModuleList([DenoiseBlock(nf) for _ in range(n_dec)])
 
         self.out = nn.Conv2d(nf, 16, 3, padding=1)
@@ -87,20 +91,18 @@ class DenoiseNet(nn.Module):
         feat = self.inp(x)
 
         skips = []
-        n = len(self.enc_blocks)
-        for i, (enc, down) in enumerate(zip(self.enc_blocks, self.downs)):
+        for i, enc in enumerate(self.enc_blocks):
             feat  = enc(feat)
             skips = [feat] + skips
-            if i < n - 1:             # last level's down() output is never used below
-                feat = down(feat)
+            if i < len(self.downs):  # bottleneck level has no down() to run
+                feat = self.downs[i](feat)
 
-        feat  = skips[0]
-        skips = skips[1:]
+        feat = skips.pop(0)
 
         for dec in self.dec_blocks:
-            up    = F.interpolate(feat, size=skips[0].shape[-2:],
-                                  mode='bilinear', align_corners=False)
-            feat = dec(skips[0] + up)
-            skips = skips[1:]
+            skip = skips.pop(0)
+            up   = F.interpolate(feat, size=skip.shape[-2:],
+                                 mode='bilinear', align_corners=False)
+            feat = dec(skip + up)
 
         return x[:, :4] + self.shuffle(self.out(feat))

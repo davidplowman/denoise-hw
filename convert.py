@@ -30,6 +30,34 @@ def round_up(value: int, align: int) -> int:
     return ((value + align - 1) // align) * align
 
 
+def compute_bayer_size(model: DenoiseNet, width: int, height: int) -> tuple[int, int, int, int]:
+    """Round width/height up to the model's required alignment and return the
+    resulting (width, height, bayer_w, bayer_h).
+
+    scaling_factors holds the stride between each encoder level and the next
+    (nafnet.DenoiseNet); there's always one more encoder level than there are
+    scaling factors (the bottleneck level has no downsample after it), and
+    every entry actually runs. So the real alignment needed is the Bayer
+    split's own halving, times the product of every scaling factor. A flat,
+    non-U-Net architecture (e.g. ffdnet.DenoiseNet) has no encoder levels at
+    all -- scaling_factors is None -- treat that as no extra downsampling.
+    """
+    align = 2
+    if model.scaling_factors:
+        for s in model.scaling_factors:
+            align *= s
+
+    new_width = round_up(width, align)
+    new_height = round_up(height, align)
+    if new_width != width:
+        print(f"  Rounding width up:  {width} -> {new_width} (must be a multiple of {align} px)")
+    if new_height != height:
+        print(f"  Rounding height up: {height} -> {new_height} (must be a multiple of {align} px)")
+
+    bayer_w, bayer_h = new_width // 2, new_height // 2
+    return new_width, new_height, bayer_w, bayer_h
+
+
 def load_model(pth_path: Path) -> DenoiseNet:
     """Build a DenoiseNet from a checkpoint, mirroring DenoiseNetwork.__init__."""
     ckpt = torch.load(pth_path, map_location="cpu")
@@ -321,24 +349,7 @@ def main(argv: list[str] | None = None) -> None:
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params:,}")
 
-    # Each encoder level with a scaling factor > 1 halves the spatial size
-    # (nafnet.DenoiseNet always uses a stride-2 Conv2d there). A flat,
-    # non-U-Net architecture (e.g. ffdnet.DenoiseNet) has no encoder levels
-    # at all -- scaling_factors is None -- so treat that as zero downsampling
-    # levels. The Bayer split itself halves width/height once more before
-    # that. Sensor width/height must therefore be a multiple of
-    # 2 * (2 ** num_downsampling_levels).
-    num_downsamples = sum(1 for s in model.scaling_factors if s > 1) if model.scaling_factors else 0
-    align = 2 * (2 ** num_downsamples)
-
-    width = round_up(args.width, align)
-    height = round_up(args.height, align)
-    if width != args.width:
-        print(f"  Rounding width up:  {args.width} -> {width} (must be a multiple of {align} px)")
-    if height != args.height:
-        print(f"  Rounding height up: {args.height} -> {height} (must be a multiple of {align} px)")
-
-    bayer_w, bayer_h = width // 2, height // 2
+    width, height, bayer_w, bayer_h = compute_bayer_size(model, args.width, args.height)
     print(f"Network input tensor shape: (1, 4, {bayer_h}, {bayer_w})")
 
     output_dir = args.output_dir or Path(args.format)

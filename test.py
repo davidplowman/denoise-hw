@@ -13,7 +13,7 @@ import ctypes
 import subprocess
 
 from denoise_hw import DenoiseHW
-from denoise_network import DenoiseNetwork
+from denoise_network import DenoiseNetwork, NcnnDenoiseNetwork
 from dng import DNG
 
 import math
@@ -67,11 +67,18 @@ def do_cdn(denoised, dng):
 def main() -> None:
     parser = argparse.ArgumentParser(description="Test DenoiseNetwork on one folder.")
     parser.add_argument("folder", help="Path relative to PI_RAW/Data (e.g. cabinet_H_2/imx219_ag1_test)")
-    parser.add_argument("--weights", required=True, metavar="PTH")
+    parser.add_argument("--weights", metavar="PTH", help="PyTorch checkpoint (.pth).")
+    parser.add_argument("--ncnn", metavar="BASENAME",
+                         help="ncnn model, without extension (loads BASENAME.param/.bin).")
     parser.add_argument("--output",  default="output", metavar="DIR")
     parser.add_argument("--dataset", default="/opt/datasets/PI_RAW", metavar="ROOT")
     parser.add_argument("--quick", action="store_true")
     args = parser.parse_args()
+
+    if not args.weights and not args.ncnn:
+        parser.error("one of --weights or --ncnn is required")
+    if args.weights and args.ncnn:
+        parser.error("--weights and --ncnn are mutually exclusive")
 
     folder = Path(args.dataset) / "Data" / args.folder
     out    = Path(args.output)
@@ -83,8 +90,13 @@ def main() -> None:
     noisy_dng = DNG(str(folder / "noisy.dng"))
     gt_dng    = DNG(str(folder / "gt.dng"))
 
-    dn       = DenoiseNetwork(noisy_dng, factor=1.0, weights_file=args.weights)
-    print(f"Model: ch={dn.model.ch}  scaling={dn.model.scaling_factors}  encoders={dn.model.num_encoders}")
+    if args.ncnn:
+        dn = NcnnDenoiseNetwork(noisy_dng, factor=1.0,
+                                 param_file=f"{args.ncnn}.param", bin_file=f"{args.ncnn}.bin")
+        print(f"Model: ncnn {args.ncnn}.{{param,bin}}")
+    else:
+        dn = DenoiseNetwork(noisy_dng, factor=1.0, weights_file=args.weights)
+        print(f"Model: ch={dn.model.ch}  scaling={dn.model.scaling_factors}  encoders={dn.model.num_encoders}")
     denoised = dn.process(noisy_dng.bayer)
 
     denoised = denoised.astype(np.float32) - noisy_dng.black_level
