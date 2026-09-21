@@ -1,4 +1,6 @@
-"""NAFNet-based Bayer denoiser model."""
+# Copyright (c) 2026 Raspberry Pi
+
+"""Simple UNET-style Bayer denoiser model."""
 
 import torch
 import torch.nn as nn

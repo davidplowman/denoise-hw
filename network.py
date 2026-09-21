@@ -5,6 +5,6 @@ convert.py, denoise_network.py, ...) imports DenoiseNet from here, not from
 a specific architecture's module.
 """
 
-from nafnet import DenoiseNet
+from denoisenet import DenoiseNet
 
 __all__ = ["DenoiseNet"]

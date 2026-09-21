@@ -34,7 +34,7 @@ same transform per input channel (verified against dwt_init's arithmetic
 directly), just expressed as a standard, ncnn-safe strided conv instead of
 strided slicing. Output channel order ends up grouped by original input
 channel rather than upstream's grouped-by-sub-band; every consumer here is
-a full (non-grouped) conv, so -- as with nafnet.py's PixelUnshuffle -- the
+a full (non-grouped) conv, so -- as with denoisenet.py's PixelUnshuffle -- the
 ordering is functionally irrelevant to what the network can learn.
 """
 
@@ -94,7 +94,7 @@ class MFA(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # size=, not the reference's bare scale_factor=2 -- matches
-        # nafnet.py's own F.interpolate(..., size=skips[0].shape[-2:], ...)
+        # denoisenet.py's own F.interpolate(..., size=skips[0].shape[-2:], ...)
         # convention; not a behaviour change in our always-power-of-2 case.
         gate = self.gate(x) #F.interpolate(self.gate(x), size=x.shape[-2:], mode='bilinear', align_corners=False)
         return x * gate
@@ -146,7 +146,7 @@ class DenoiseNet(nn.Module):
     codebase).
 
     scaling_factors/num_encoders don't apply (no U-Net encoder levels). ch
-    doesn't apply either: unlike nafnet/ffdnet, there's no free-standing
+    doesn't apply either: unlike denoisenet/ffdnet, there's no free-standing
     "channel width" knob here -- the Haar transform fixes the channel count
     flowing through the MFDB stack at 4x the input channels (16 for our
     4-channel input), by construction, not as a tunable choice. Model size

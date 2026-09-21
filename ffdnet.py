@@ -9,7 +9,7 @@ FFDNet ordinarily pixel-unshuffles a 1-channel image ×2 into 4 sub-images
 pixel-shuffles the result back up. Our 4 Bayer planes already *are* that
 4-sub-image representation -- one level of Bayer-splitting further down --
 and the caller (denoise_network.py) already reassembles the output back to
-full resolution, same as for nafnet.DenoiseNet. So this is just FFDNet's
+full resolution, same as for denoisenet.DenoiseNet. So this is just FFDNet's
 conv stack itself, operating directly on the 4 Bayer channels in and out:
 no PixelUnshuffle/PixelShuffle, no noise-level map (may be added later as
 an extra input channel), no batch norm (matches FFDNet's default
@@ -29,7 +29,7 @@ class DenoiseNet(nn.Module):
     Output of forward(): (B, 4, H/2, W/2) -- denoised Bayer channels.
     Unlike upstream FFDNet's forward() (which returns the stack's raw
     output), a residual connection back to the input is added here, as in
-    nafnet.DenoiseNet -- consistent with the rest of this codebase, and
+    denoisenet.DenoiseNet -- consistent with the rest of this codebase, and
     generally easier to train than direct regression.
 
     scaling_factors/num_encoders are U-Net encoder-level concepts that

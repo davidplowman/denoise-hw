@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Convert a DenoiseNet .pth checkpoint to NCNN, LiteRT (TFLite), or ONNX model files.
+"""Convert a DenoiseNet .pth checkpoint to NCNN, LiteRT (TFLite), ONNX, or
+OpenVINO model files.
 
 Only the network itself (network.DenoiseNet) is exported. The Bayer split/
 merge and white_level normalisation done around it in denoise_network.py are
@@ -10,6 +11,7 @@ Example:
     python convert.py checkpoints/imx662_32_2221e1221_07908.pth --verify
     python convert.py checkpoints/imx662_32_2221e1221_07908.pth --format lite --verify
     python convert.py checkpoints/imx662_32_2221e1221_07908.pth --format onnx --verify
+    python convert.py checkpoints/imx662_32_2221e1221_07908.pth --format openvino --verify
 """
 
 from __future__ import annotations
@@ -35,7 +37,7 @@ def compute_bayer_size(model: DenoiseNet, width: int, height: int) -> tuple[int,
     resulting (width, height, bayer_w, bayer_h).
 
     scaling_factors holds the stride between each encoder level and the next
-    (nafnet.DenoiseNet); there's always one more encoder level than there are
+    (denoisenet.DenoiseNet); there's always one more encoder level than there are
     scaling factors (the bottleneck level has no downsample after it), and
     every entry actually runs. So the real alignment needed is the Bayer
     split's own halving, times the product of every scaling factor. A flat,
@@ -82,11 +84,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("pth_file", type=Path, help="Trained checkpoint to convert (.pth).")
     parser.add_argument(
-        "--format", choices=["ncnn", "lite", "onnx"], default="ncnn",
+        "--format", choices=["ncnn", "lite", "onnx", "openvino"], default="ncnn",
         help="Target format (default: %(default)s). 'ncnn' writes a .param/.bin pair "
              "(via pnnx); 'lite' writes a single .tflite file for ai-edge-litert "
              "(via litert_torch); 'onnx' writes a single .onnx file (via "
-             "torch.onnx.export, cleaned up with onnxsim).",
+             "torch.onnx.export, cleaned up with onnxsim); 'openvino' writes an "
+             "IR .xml/.bin pair (via openvino.convert_model).",
     )
     parser.add_argument(
         "--width", type=int, default=1936,
@@ -305,6 +308,45 @@ def verify_onnx(model: DenoiseNet, example: torch.Tensor, outputs: list[Path], q
     _report_diff(out.astype(np.float32), ref, example, quantize, engine="ONNX Runtime")
 
 
+def export_openvino(
+    model: DenoiseNet, example: torch.Tensor, out_prefix: Path,
+    quantize: str, _keep_intermediate: bool,
+) -> list[Path]:
+    """Export to OpenVINO IR (.xml/.bin) via openvino.convert_model. Returns [xml_path, bin_path].
+
+    convert_model always produces fp32 weights; save_model's compress_to_fp16
+    does the fp16 packing as a separate step (OpenVINO's equivalent of pnnx's
+    fp16=True for ncnn). No intermediate files are produced, so
+    _keep_intermediate is unused, as for --format lite/onnx.
+    """
+    import openvino as ov  # imported lazily so --help works without it installed
+
+    xml_path = out_prefix.with_suffix(".xml")
+    bin_path = out_prefix.with_suffix(".bin")
+
+    ov_model = ov.convert_model(model, example_input=example)
+    ov.save_model(ov_model, str(xml_path), compress_to_fp16=(quantize == "fp16"))
+
+    if not (xml_path.exists() and bin_path.exists()):
+        sys.exit("error: conversion did not produce the expected .xml/.bin files")
+    return [xml_path, bin_path]
+
+
+def verify_openvino(model: DenoiseNet, example: torch.Tensor, outputs: list[Path], quantize: str) -> None:
+    import openvino as ov
+
+    xml_path = outputs[0]
+    with torch.no_grad():
+        ref = model(example)[0].numpy()  # (4, bayer_h, bayer_w)
+
+    core = ov.Core()
+    compiled = core.compile_model(str(xml_path), "CPU")
+    req = compiled.create_infer_request()
+    req.infer({0: example.numpy()})
+    out = req.get_output_tensor(0).data[0]
+    _report_diff(out, ref, example, quantize, engine="OpenVINO")
+
+
 def _report_diff(out, ref, example: torch.Tensor, quantize: str, engine: str) -> None:
     import numpy as np
 
@@ -326,6 +368,7 @@ FORMATS = {
     "ncnn": (export_ncnn, verify_ncnn),
     "lite": (export_lite, verify_lite),
     "onnx": (export_onnx, verify_onnx),
+    "openvino": (export_openvino, verify_openvino),
 }
 
 
