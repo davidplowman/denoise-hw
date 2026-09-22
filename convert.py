@@ -199,32 +199,36 @@ def verify_ncnn(model: DenoiseNet, example: torch.Tensor, outputs: list[Path], q
     _report_diff(out, ref, example, quantize, engine="ncnn")
 
 
-def _lite_quant_config(quantize: str):
-    """Build the litert_torch QuantConfig for the requested precision."""
-    if quantize != "fp16":
-        return None
-    # Weight-only fp16 casting (activations/compute stay fp32) - the LiteRT
-    # equivalent of pnnx's fp16=True for ncnn.
-    from litert_torch.generative.quantize.quant_recipe import GenerativeQuantRecipe
-    from litert_torch.generative.quantize.quant_recipe_utils import create_layer_quant_fp16
-    from litert_torch.quantize.quant_config import QuantConfig
-
-    return QuantConfig(generative_recipe=GenerativeQuantRecipe(default=create_layer_quant_fp16()))
-
-
 def export_lite(
     model: DenoiseNet, example: torch.Tensor, out_prefix: Path,
     quantize: str, _keep_intermediate: bool,
 ) -> list[Path]:
     """Export to a LiteRT (.tflite) flatbuffer via litert_torch. Returns [tflite_path].
 
+    Per how-to-convert.txt (matching this repo's working NPU export for the m9
+    model): always export plain fp32 -- fp16 weight-only quantization introduces
+    DEQUANTIZE ops that break NPU compilation. And wrap the model with
+    to_channel_last_io so the NCHW<->NHWC conversion happens for free at the
+    graph boundary; otherwise litert_torch inserts it as mid-graph Transpose
+    ops, which were the only unsupported nodes left and fragmented compilation
+    into 8 partitions. The traced example is permuted to NHWC to match.
+
     litert_torch produces no intermediate files to clean up, so _keep_intermediate
     is accepted (for a uniform export-function signature) but unused.
     """
     import litert_torch  # imported lazily so --help works without it installed
 
+    if quantize == "fp16":
+        print("  Note: --quantize fp16 is ignored for --format lite (breaks NPU "
+              "compilation -- see how-to-convert.txt); exporting fp32 instead.")
+
     tflite_path = out_prefix.with_suffix(".tflite")
-    edge_model = litert_torch.convert(model, (example,), quant_config=_lite_quant_config(quantize))
+    # .eval() on the wrapper itself, not just model -- ChannelLastIOWrapper is
+    # its own nn.Module and defaults to training mode regardless of the inner
+    # model's mode.
+    wrapper = litert_torch.to_channel_last_io(model, args=[0], outputs=[0]).eval()
+    example_nhwc = example.permute(0, 2, 3, 1).contiguous()
+    edge_model = litert_torch.convert(wrapper, (example_nhwc,))
     edge_model.export(str(tflite_path))
 
     if not tflite_path.exists():
@@ -239,13 +243,16 @@ def verify_lite(model: DenoiseNet, example: torch.Tensor, outputs: list[Path], q
     with torch.no_grad():
         ref = model(example)[0].numpy()  # (4, bayer_h, bayer_w)
 
+    example_nhwc = example.permute(0, 2, 3, 1).contiguous().numpy()
+
     interp = Interpreter(model_path=str(tflite_path))
     interp.allocate_tensors()
     in_det = interp.get_input_details()[0]
     out_det = interp.get_output_details()[0]
-    interp.set_tensor(in_det["index"], example.numpy().astype(in_det["dtype"]))
+    interp.set_tensor(in_det["index"], example_nhwc.astype(in_det["dtype"]))
     interp.invoke()
-    out = interp.get_tensor(out_det["index"])[0]
+    out = interp.get_tensor(out_det["index"])[0]  # (bayer_h, bayer_w, 4), NHWC
+    out = out.transpose(2, 0, 1)  # -> (4, bayer_h, bayer_w) to match ref
     _report_diff(out, ref, example, quantize, engine="LiteRT")
 
 
