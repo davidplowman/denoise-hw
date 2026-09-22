@@ -40,11 +40,14 @@ def compute_bayer_size(model: DenoiseNet, width: int, height: int) -> tuple[int,
     (denoisenet.DenoiseNet); there's always one more encoder level than there are
     scaling factors (the bottleneck level has no downsample after it), and
     every entry actually runs. So the real alignment needed is the Bayer
-    split's own halving, times the product of every scaling factor. A flat,
-    non-U-Net architecture (e.g. ffdnet.DenoiseNet) has no encoder levels at
-    all -- scaling_factors is None -- treat that as no extra downsampling.
+    split's own halving, times self.inp's own downscale (denoisenet.DenoiseNet
+    always downsamples once more via a strided self.inp before any encoder
+    level runs; a flat, non-U-Net architecture like ffdnet.DenoiseNet has no
+    self.inp at all, i.e. no extra downscale there), times the product of
+    every scaling factor.
     """
-    align = 2
+    inp_stride = getattr(getattr(model, "inp", None), "stride", (1,))
+    align = 2 * inp_stride[0]
     if model.scaling_factors:
         for s in model.scaling_factors:
             align *= s
