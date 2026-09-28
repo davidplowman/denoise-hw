@@ -7,7 +7,7 @@ import torch
 
 from denoise_hw import DenoiseHW
 from dng import DNG
-from network import DenoiseNet
+from network import DenoiseNet, depth_to_space, space_to_depth
 
 
 class DenoiseNetwork(DenoiseHW):
@@ -57,12 +57,13 @@ class DenoiseNetwork(DenoiseHW):
 
         ch = np.stack([img[0::2, 0::2], img[0::2, 1::2],
                        img[1::2, 0::2], img[1::2, 1::2]], axis=0)
-        x = torch.from_numpy(ch / self.white_level).unsqueeze(0).float()
+        x_bayer = torch.from_numpy(ch / self.white_level).unsqueeze(0).float()
+        x = space_to_depth(x_bayer, 2)
 
         with torch.no_grad():
             out = self.model(x)
 
-        ch_out = out.squeeze(0).numpy() * self.white_level
+        ch_out = depth_to_space(out, 2).squeeze(0).numpy() * self.white_level
         result = np.empty_like(img)
         result[0::2, 0::2] = ch_out[0]
         result[0::2, 1::2] = ch_out[1]
@@ -113,7 +114,8 @@ class NcnnDenoiseNetwork(DenoiseHW):
 
         ch = np.stack([img[0::2, 0::2], img[0::2, 1::2],
                        img[1::2, 0::2], img[1::2, 1::2]], axis=0)
-        x = (ch / self.white_level).astype(np.float32)
+        x_bayer = torch.from_numpy(ch / self.white_level).unsqueeze(0).float()
+        x = space_to_depth(x_bayer, 2).squeeze(0).numpy()
 
         ex = self.net.create_extractor()
         ex.input(self.net.input_names()[0], ncnn.Mat(x))
@@ -121,7 +123,8 @@ class NcnnDenoiseNetwork(DenoiseHW):
         if ret != 0:
             raise RuntimeError(f"ncnn extraction failed (ret={ret})")
 
-        ch_out = mat_out.numpy() * self.white_level
+        out = torch.from_numpy(mat_out.numpy()).unsqueeze(0)
+        ch_out = depth_to_space(out, 2).squeeze(0).numpy() * self.white_level
         result = np.empty_like(img)
         result[0::2, 0::2] = ch_out[0]
         result[0::2, 1::2] = ch_out[1]

@@ -15,18 +15,19 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from dataset import load_datasets
-from network import DenoiseNet
+from network import DenoiseNet, space_to_depth
 
 
 def _receptive_field(model: DenoiseNet, h: int = 128) -> int:
     """Estimate receptive field in full-resolution Bayer pixels via gradient backpropagation.
 
     Backprops from a single centre output pixel; the bounding box of non-zero
-    input gradients gives the RF in Bayer-split space. Multiply by 2 because
-    each Bayer-split pixel corresponds to a 2×2 region in the original image.
+    input gradients gives the RF in packed space. Multiply by 4 because each
+    packed pixel corresponds to a 4×4 region in the original image (a 2×2
+    Bayer split, further packed 2×2).
     """
     device = next(model.parameters()).device
-    x = torch.rand(1, 4, h, h, device=device, requires_grad=True)
+    x = torch.rand(1, 16, h, h, device=device, requires_grad=True)
     was_training = model.training
     model.eval()
     with torch.enable_grad():
@@ -41,7 +42,7 @@ def _receptive_field(model: DenoiseNet, h: int = 128) -> int:
     nz = grad.nonzero()
     rf_h = nz[:, 0].max().item() - nz[:, 0].min().item() + 1
     rf_w = nz[:, 1].max().item() - nz[:, 1].min().item() + 1
-    return max(rf_h, rf_w) * 2  # Bayer-split → full-resolution Bayer pixels
+    return max(rf_h, rf_w) * 4  # packed → full-resolution Bayer pixels
 
 
 def _macs_per_pixel(model: DenoiseNet, patch_size: int = 256) -> int:
@@ -58,9 +59,9 @@ def _macs_per_pixel(model: DenoiseNet, patch_size: int = 256) -> int:
     handles = [m.register_forward_hook(_hook)
                for m in model.modules() if isinstance(m, torch.nn.Conv2d)]
     device = next(model.parameters()).device
-    h = patch_size // 2
+    h = patch_size // 4
     with torch.no_grad():
-        model(torch.zeros(1, 4, h, h, device=device))
+        model(torch.zeros(1, 16, h, h, device=device))
     for hnd in handles:
         hnd.remove()
     return total // (patch_size * patch_size)
@@ -82,17 +83,22 @@ def _prepare_input(
     """Build network input and targets from a dataset batch.
 
     Returns:
-        x:       (B, 4, H/2, W/2) normalised input (4 Bayer channels)
-        gt_ch:   (B, 4, H/2, W/2) normalised ground-truth channels
-        cg:      (B, 4) per-channel WB gains
+        x:       (B, 16, H/4, W/4) normalised, packed input (4 Bayer channels,
+                 further space-to-depth'd 2x2)
+        gt_ch:   (B, 16, H/4, W/4) normalised, packed ground-truth channels
+        cg:      (B, 16) per-channel WB gains
     """
     wl = batch["white_level"].float().to(device).view(-1, 1, 1, 1)
     noisy = batch["noisy"].to(device)
     gt    = batch["gt"].to(device)
 
-    x     = _split(noisy) / wl
-    gt_ch = _split(gt) / wl
-    cg    = batch["channel_gains"].to(device)
+    x     = space_to_depth(_split(noisy) / wl, 2)
+    gt_ch = space_to_depth(_split(gt) / wl, 2)
+    # Each of the 4 Bayer-split channels expands to 4 packed channels
+    # (space_to_depth's channel k's original channel is k // 4 -- verified
+    # against F.pixel_unshuffle's actual convention), so the WB gain just
+    # repeats 4x per original channel.
+    cg    = batch["channel_gains"].to(device).repeat_interleave(4, dim=1)
     return x, gt_ch, cg
 
 
@@ -104,10 +110,10 @@ def _loss(
     """MSE loss in white-balanced, gamma-corrected space.
 
     Args:
-        pred, gt_ch:    (B, 4, H/2, W/2) normalised Bayer channel tensors.
-        channel_gains:  (B, 4) per-channel WB gains.
+        pred, gt_ch:    (B, 16, H/4, W/4) normalised, packed Bayer tensors.
+        channel_gains:  (B, 16) per-channel WB gains.
     """
-    gains   = channel_gains.view(-1, 4, 1, 1)
+    gains   = channel_gains.view(-1, 16, 1, 1)
     eps = 1e-6
     pred_wb = (torch.clamp(pred  * gains, 0.0, 1.0) + eps) ** (1 / 2.2)
     gt_wb   = (torch.clamp(gt_ch * gains, 0.0, 1.0) + eps) ** (1 / 2.2)

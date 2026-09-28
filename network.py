@@ -5,6 +5,6 @@ convert.py, denoise_network.py, ...) imports DenoiseNet from here, not from
 a specific architecture's module.
 """
 
-from denoisenet import DenoiseNet
+from denoisenet import DenoiseNet, depth_to_space, space_to_depth
 
-__all__ = ["DenoiseNet"]
+__all__ = ["DenoiseNet", "space_to_depth", "depth_to_space"]

@@ -3,9 +3,10 @@
 OpenVINO model files.
 
 Only the network itself (network.DenoiseNet) is exported. The Bayer split/
-merge and white_level normalisation done around it in denoise_network.py are
-NOT part of the exported graph and must be reproduced by whatever code calls
-the converted model.
+merge, the further 2x2 space-to-depth/depth-to-space packing, and
+white_level normalisation done around it in denoise_network.py are NOT part
+of the exported graph and must be reproduced by whatever code calls the
+converted model.
 
 Example:
     python convert.py checkpoints/imx662_32_2221e1221_07908.pth --verify
@@ -34,20 +35,22 @@ def round_up(value: int, align: int) -> int:
 
 def compute_bayer_size(model: DenoiseNet, width: int, height: int) -> tuple[int, int, int, int]:
     """Round width/height up to the model's required alignment and return the
-    resulting (width, height, bayer_w, bayer_h).
+    resulting (width, height, bayer_w, bayer_h) -- bayer_w/bayer_h being the
+    intermediate Bayer-split size, before the caller's further 2x2 packing
+    (see pack_size below).
 
     scaling_factors holds the stride between each encoder level and the next
     (denoisenet.DenoiseNet); there's always one more encoder level than there are
     scaling factors (the bottleneck level has no downsample after it), and
     every entry actually runs. So the real alignment needed is the Bayer
-    split's own halving, times self.inp's own downscale (denoisenet.DenoiseNet
-    always downsamples once more via a strided self.inp before any encoder
-    level runs; a flat, non-U-Net architecture like ffdnet.DenoiseNet has no
-    self.inp at all, i.e. no extra downscale there), times the product of
-    every scaling factor.
+    split's own halving, times the caller's further fixed 2x2 packing before
+    self.inp (self.inp is a plain pointwise conv with no downscale of its
+    own -- the 2x2 factor here is always present, unlike self.inp's own
+    downscale in earlier variants, kept as a defensive fallback for those),
+    times the product of every scaling factor.
     """
     inp_stride = getattr(getattr(model, "inp", None), "stride", (1,))
-    align = 2 * inp_stride[0]
+    align = 2 * 2 * inp_stride[0]
     if model.scaling_factors:
         for s in model.scaling_factors:
             align *= s
@@ -61,6 +64,12 @@ def compute_bayer_size(model: DenoiseNet, width: int, height: int) -> tuple[int,
 
     bayer_w, bayer_h = new_width // 2, new_height // 2
     return new_width, new_height, bayer_w, bayer_h
+
+
+def pack_size(bayer_w: int, bayer_h: int) -> tuple[int, int]:
+    """Bayer-split size -> the network's actual (packed_w, packed_h) after
+    the caller's further 2x2 space-to-depth packing."""
+    return bayer_w // 2, bayer_h // 2
 
 
 def load_model(pth_path: Path) -> DenoiseNet:
@@ -118,7 +127,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--output-name", default=None,
         help="Base filename, without extension, for the output files "
-             "(default: '<output stem>_<width>x<height>_<quantize>').",
+             "(default: '<output stem>_<tensor CxHxW>_<quantize>').",
     )
     parser.add_argument(
         "--output-stem", default=None,
@@ -188,7 +197,7 @@ def verify_ncnn(model: DenoiseNet, example: torch.Tensor, outputs: list[Path], q
 
     param_path, bin_path = outputs
     with torch.no_grad():
-        ref = model(example)[0].numpy()  # (4, bayer_h, bayer_w)
+        ref = model(example)[0].numpy()  # (16, packed_h, packed_w)
 
     net = ncnn.Net()
     net.load_param(str(param_path))
@@ -244,7 +253,7 @@ def verify_lite(model: DenoiseNet, example: torch.Tensor, outputs: list[Path], q
 
     (tflite_path,) = outputs
     with torch.no_grad():
-        ref = model(example)[0].numpy()  # (4, bayer_h, bayer_w)
+        ref = model(example)[0].numpy()  # (16, packed_h, packed_w)
 
     example_nhwc = example.permute(0, 2, 3, 1).contiguous().numpy()
 
@@ -254,8 +263,8 @@ def verify_lite(model: DenoiseNet, example: torch.Tensor, outputs: list[Path], q
     out_det = interp.get_output_details()[0]
     interp.set_tensor(in_det["index"], example_nhwc.astype(in_det["dtype"]))
     interp.invoke()
-    out = interp.get_tensor(out_det["index"])[0]  # (bayer_h, bayer_w, 4), NHWC
-    out = out.transpose(2, 0, 1)  # -> (4, bayer_h, bayer_w) to match ref
+    out = interp.get_tensor(out_det["index"])[0]  # (packed_h, packed_w, 16), NHWC
+    out = out.transpose(2, 0, 1)  # -> (16, packed_h, packed_w) to match ref
     _report_diff(out, ref, example, quantize, engine="LiteRT")
 
 
@@ -347,7 +356,7 @@ def verify_openvino(model: DenoiseNet, example: torch.Tensor, outputs: list[Path
 
     xml_path = outputs[0]
     with torch.no_grad():
-        ref = model(example)[0].numpy()  # (4, bayer_h, bayer_w)
+        ref = model(example)[0].numpy()  # (16, packed_h, packed_w)
 
     core = ov.Core()
     compiled = core.compile_model(str(xml_path), "CPU")
@@ -402,17 +411,22 @@ def main(argv: list[str] | None = None) -> None:
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params:,}")
 
-    width, height, bayer_w, bayer_h = compute_bayer_size(model, args.width, args.height)
-    print(f"Network input tensor shape: (1, 4, {bayer_h}, {bayer_w})")
+    _, _, bayer_w, bayer_h = compute_bayer_size(model, args.width, args.height)
+    packed_w, packed_h = pack_size(bayer_w, bayer_h)
+    print(f"Network input tensor shape: (1, 16, {packed_h}, {packed_w})")
+    # Tag outputs with the actual network input tensor shape (post-padding),
+    # not the requested/nominal image size -- so the filename always
+    # reflects what the network really ran on.
+    tensor_shape = f"16x{packed_h}x{packed_w}"
 
     output_dir = args.output_dir or Path(args.format)
     output_dir.mkdir(parents=True, exist_ok=True)
     output_stem = args.output_stem or args.pth_file.stem
-    base_name = args.output_name or f"{output_stem}_{width}x{height}_{args.quantize}"
+    base_name = args.output_name or f"{output_stem}_{tensor_shape}_{args.quantize}"
     out_prefix = output_dir / base_name
 
     torch.manual_seed(args.seed)
-    example = torch.rand(1, 4, bayer_h, bayer_w)
+    example = torch.rand(1, 16, packed_h, packed_w)
 
     export_fn, verify_fn = FORMATS[args.format]
 

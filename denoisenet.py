@@ -9,6 +9,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def space_to_depth(x: torch.Tensor, r: int) -> torch.Tensor:
+    """(B, C, H, W) -> (B, C*r*r, H/r, W/r) via pixel-unshuffle.
+
+    Channel index c*r*r + i*r + j holds original channel c's (i, j)
+    sub-position within each rxr block -- i.e. output channel k's original
+    channel is k // (r*r), so per-original-channel data (e.g. white-balance
+    gains) expands to the packed channels via repeat_interleave(r*r, dim=1).
+    Verified against PyTorch's own convention, not just assumed.
+    """
+    return F.pixel_unshuffle(x, r)
+
+
+def depth_to_space(x: torch.Tensor, r: int) -> torch.Tensor:
+    """Inverse of space_to_depth: (B, C*r*r, H, W) -> (B, C, H*r, W*r)."""
+    return F.pixel_shuffle(x, r)
+
+
 def _replicate_pad1(x: torch.Tensor) -> torch.Tensor:
     """Amount-1 replicate padding via slice + concat.
 
@@ -92,13 +109,16 @@ class DenoiseBlock(nn.Module):
 
 
 class DenoiseNet(nn.Module):
-    """Unet-style denoiser operating on Bayer-split pixel values.
+    """Unet-style denoiser operating on space-to-depth-packed Bayer values.
 
-    Input to forward(): (B, 4, H/2, W/2) — 4 Bayer channels,
-    normalised to [0, 1] by white_level.
+    Input to forward(): (B, 16, H/4, W/4) -- the 4 Bayer channels, further
+    packed 2x2 via space_to_depth(2), normalised to [0, 1] by white_level.
+    The Bayer split and this extra packing are both done by the caller, same
+    as white_level normalisation -- neither is part of this model.
 
-    Output of forward(): (B, 4, H/2, W/2) — denoised Bayer channels
-    (residual added to the 4 input pixel channels).
+    Output of forward(): (B, 16, H/4, W/4) -- denoised, still packed
+    (residual added directly in packed space). The caller unpacks the
+    result back to (B, 4, H/2, W/2) with depth_to_space(2).
 
     scaling_factors controls subsampling between encoder levels: each entry
     is the stride between one encoder level and the next (N = downsample ×N
@@ -127,7 +147,7 @@ class DenoiseNet(nn.Module):
         self.scaling_factors = sf
         self.num_encoders = num_encoders
 
-        self.inp = nn.Conv2d(4, nf, 2, stride=2)
+        self.inp = nn.Conv2d(16, nf, 1)
 
         self.enc_blocks = nn.ModuleList([
             nn.Sequential(*[DenoiseBlock(nf) for _ in range(n)]) for n in num_encoders
@@ -144,14 +164,13 @@ class DenoiseNet(nn.Module):
         n_dec = len(sf)
         self.dec_blocks = nn.ModuleList([DenoiseBlock(nf) for _ in range(n_dec)])
         # For when the target platform needs to avoid F.interpolate.
-        self.ups = nn.ModuleList([FixedBilinearUpsample(nf, s) for s in reversed(sf)])
+        #self.ups = nn.ModuleList([FixedBilinearUpsample(nf, s) for s in reversed(sf)])
 
         self.out = nn.Conv2d(nf, 16, 3, padding=1)
         #self.out = nn.Sequential(
         #    nn.Conv2d(nf, nf, 3, padding=1, groups=nf),
         #    nn.Conv2d(nf, 16, 1),
         #)
-        self.shuffle = nn.PixelShuffle(2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         feat = self.inp(x)
@@ -168,7 +187,8 @@ class DenoiseNet(nn.Module):
         for j, dec in enumerate(self.dec_blocks):
             skip = skips.pop(0)
             # up = F.interpolate(feat, size=skip.shape[-2:], mode='bilinear', align_corners=False)
-            up   = self.ups[j](feat)
+            up = F.interpolate(feat, size=skip.shape[-2:], mode='nearest')
+            #up   = self.ups[j](feat)
             feat = dec(skip + up)
 
-        return x[:, :4] + self.shuffle(self.out(feat))
+        return x + self.out(feat)
