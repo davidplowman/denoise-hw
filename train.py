@@ -14,7 +14,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from dataset import load_datasets
+from dataset import load_datasets, worker_init_fn
 from network import DenoiseNet, space_to_depth
 
 
@@ -127,6 +127,11 @@ def main() -> None:
     parser.add_argument("--filter",       nargs="*",  default=None)
     parser.add_argument("--detail-top",   type=float, default=1.0)
     parser.add_argument("--val-frac",     type=float, default=0.1)
+    parser.add_argument("--gain-aug-prob", type=float, default=0.5,
+                         help="probability of applying random gain augmentation "
+                              "to a training patch (0 disables it)")
+    parser.add_argument("--gain-aug-max", type=float, default=2.0,
+                         help="upper bound of the [1.0, gain_aug_max] gain range")
     parser.add_argument("--resume",       default=None, metavar="WEIGHTS")
     parser.add_argument("--lr",           type=float, default=1e-3)
     parser.add_argument("--lr-min",       type=float, default=1e-5)
@@ -152,11 +157,14 @@ def main() -> None:
         filters=args.filter,
         detail_top=args.detail_top,
         val_frac=args.val_frac,
+        gain_aug_prob=args.gain_aug_prob,
+        gain_aug_max=args.gain_aug_max,
     )
     print(f"  train: {len(train_ds)} patches,  val: {len(val_ds)} patches")
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size,
-                              shuffle=True,  num_workers=4, pin_memory=True)
+                              shuffle=True,  num_workers=4, pin_memory=True,
+                              worker_init_fn=worker_init_fn)
     val_loader   = DataLoader(val_ds,   batch_size=args.batch_size,
                               shuffle=False, num_workers=4, pin_memory=True)
 

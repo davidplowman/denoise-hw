@@ -139,10 +139,19 @@ class PatchDataset:
         records: list[ImageRecord],
         images: dict[str, dict[str, np.ndarray]],
         patch_size: int,
+        gain_aug_prob: float = 0.0,
+        gain_aug_max: float = 1.0,
     ) -> None:
         self._records = records
         self._images = images
         self._patch_size = patch_size
+        self._gain_aug_prob = gain_aug_prob
+        self._gain_aug_max = gain_aug_max
+        self._rng = np.random.default_rng()
+
+    def reseed(self, seed: int) -> None:
+        """Re-seed the augmentation RNG (call from a DataLoader worker_init_fn)."""
+        self._rng = np.random.default_rng(seed)
 
     def __len__(self) -> int:
         return len(self._records)
@@ -152,9 +161,18 @@ class PatchDataset:
         r0, c0 = rec.top_left
         p = self._patch_size
         imgs = self._images[rec.path]
+        noisy = imgs["noisy"][r0:r0+p, c0:c0+p].astype(np.float32)
+        gt    = imgs["gt"]   [r0:r0+p, c0:c0+p].astype(np.float32)
+
+        if self._gain_aug_prob > 0 and self._rng.random() < self._gain_aug_prob:
+            g = np.float32(self._rng.uniform(1.0, self._gain_aug_max))
+            bl, wl = imgs["black_level"], imgs["white_level"]
+            noisy = np.clip((noisy - bl) * g + bl, 0.0, wl).astype(np.float32)
+            gt    = np.clip((gt    - bl) * g + bl, 0.0, wl).astype(np.float32)
+
         return {
-            "noisy":         imgs["noisy"]   [r0:r0+p, c0:c0+p].astype(np.float32),
-            "gt":            imgs["gt"]      [r0:r0+p, c0:c0+p].astype(np.float32),
+            "noisy":         noisy,
+            "gt":            gt,
             "channel_gains": imgs["channel_gains"],
             "white_level":   imgs["white_level"],
         }
@@ -164,11 +182,21 @@ class PatchDataset:
             yield self[i]
 
 
+def worker_init_fn(worker_id: int) -> None:
+    """Re-seed a PatchDataset's augmentation RNG in each DataLoader worker."""
+    import torch
+
+    info = torch.utils.data.get_worker_info()
+    info.dataset.reseed(info.seed)
+
+
 def load_datasets(
     cache_dir: str = "cache",
     filters: list[str] | None = None,
     detail_top: float = 1.0,
     val_frac: float = 0.1,
+    gain_aug_prob: float = 0.0,
+    gain_aug_max: float = 1.0,
 ) -> tuple[PatchDataset, PatchDataset]:
     """Load train and validation patch datasets from the cache.
 
@@ -177,6 +205,10 @@ def load_datasets(
         filters: Substrings that must all appear in a patch's folder path.
         detail_top: Fraction of patches to retain (highest detail first).
         val_frac: Fraction of retained patches used for validation.
+        gain_aug_prob: Probability of applying random gain augmentation to a
+            training patch (see :class:`PatchDataset`). Not applied to
+            validation patches.
+        gain_aug_max: Upper bound of the ``[1.0, gain_aug_max]`` gain range.
 
     Returns:
         ``(train_ds, val_ds)`` as :class:`PatchDataset` instances.
@@ -217,13 +249,17 @@ def load_datasets(
                 "gt":            gt_dng.bayer,
                 "channel_gains": channel_gains,
                 "white_level":   np.int32(noisy_dng.white_level),
+                "black_level":   np.float32(noisy_dng.black_level),
             }
 
     n_val = max(1, int(len(all_records) * val_frac))
     train_records = all_records[:-n_val]
     val_records = all_records[-n_val:]
 
-    return PatchDataset(train_records, images, patch_size), PatchDataset(val_records, images, patch_size)
+    train_ds = PatchDataset(train_records, images, patch_size,
+                             gain_aug_prob=gain_aug_prob, gain_aug_max=gain_aug_max)
+    val_ds = PatchDataset(val_records, images, patch_size)
+    return train_ds, val_ds
 
 
 # ---------------------------------------------------------------------------
