@@ -172,7 +172,7 @@ class DenoiseNet(nn.Module):
         #    nn.Conv2d(nf, 16, 1),
         #)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def residual(self, x: torch.Tensor) -> torch.Tensor:
         feat = self.inp(x)
 
         skips = []
@@ -191,4 +191,22 @@ class DenoiseNet(nn.Module):
             #up   = self.ups[j](feat)
             feat = dec(skip + up)
 
-        return x + self.out(feat)
+        return self.out(feat)
+
+    def forward(self, x: torch.Tensor) ->torch.Tensor:
+        return x + self.residual(x)
+
+
+class ResidualDenoiseNet(nn.Module):
+    """Wraps a DenoiseNet to export just its residual branch (no skip add).
+
+    Used for int8 export: the skip connection is added back by the target
+    platform itself, in full float precision, after inference.
+    """
+
+    def __init__(self, net: DenoiseNet) -> None:
+        super().__init__()
+        self.net = net
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net.residual(x)
