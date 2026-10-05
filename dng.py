@@ -137,15 +137,20 @@ class DNG:
         tuning: Loaded tuning object for the sensor.
     """
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, sensor_name: str | None = None) -> None:
         """Load a DNG file and extract Bayer data and EXIF metadata.
 
         Args:
             path: Path to the DNG file to load.
+            sensor_name: Sensor identifier to use directly, bypassing
+                folder-name inference. Needed for datasets whose folder
+                names don't encode the sensor (e.g. per-clip folders like
+                "office_0" rather than "noisy.dng"-containing folders named
+                after the sensor).
         """
         self.path = str(path)
         folder = Path(path).parent
-        self.sensor_name: str = _sensor_from_folder(folder)
+        self.sensor_name: str = sensor_name if sensor_name is not None else _sensor_from_folder(folder)
         self.tuning = load_tuning(self.sensor_name)
 
         with rawpy.imread(self.path) as raw:
@@ -172,7 +177,8 @@ class DNG:
 
     def to_rgb(self, bayer: np.ndarray | None = None, *,
                subtract_black_level: bool = True,
-               apply_colour_gains: bool = True) -> np.ndarray:
+               apply_colour_gains: bool = True,
+               output_bps: int = 8) -> np.ndarray:
         """Convert (optionally pre-processed) Bayer data to an RGB image.
 
         Args:
@@ -183,9 +189,12 @@ class DNG:
                    (sets rawpy's user_black to 0).
             apply_colour_gains: If False, skip white-balance gains
                    (uses neutral 1:1:1:1 multipliers).
+            output_bps: Output bit depth, 8 or 16 (passed through to
+                   rawpy's postprocess).
 
         Returns:
-            uint8 RGB image array of shape (H, W, 3).
+            RGB image array of shape (H, W, 3), uint8 if output_bps=8 or
+            uint16 if output_bps=16.
         """
         if bayer is None:
             bayer = self.bayer
@@ -199,7 +208,7 @@ class DNG:
         bl_kwargs = {"user_black": black_level}
         with rawpy.imread(self.path) as raw:
             raw.raw_image_visible[:] = bayer
-            return raw.postprocess(**wb_kwargs, **bl_kwargs)
+            return raw.postprocess(**wb_kwargs, **bl_kwargs, output_bps=output_bps)
 
     # ------------------------------------------------------------------
     # Private helpers

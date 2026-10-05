@@ -18,8 +18,8 @@ run_training() {
         echo "***********************************************************************"
         echo "Run ${i}  (ch=${ch}  scaling=${scaling}  encoders=${encoders})"
         echo "***********************************************************************"
-        python train.py --cache cache_imx662 --ch "$ch" --scaling "$scaling" --encoders $encoders --no-pbar
-        python test.py cabinet_D50_1/imx662_ag128_test0 --dataset /opt/datasets/IMX662 --weights checkpoints/best.pth --quick
+        python train.py --cache cache_imx662 --ch "$ch" --scaling "$scaling" --encoders $encoders --no-pbar --filter ag4
+        python test.py cabinet_D50_100/imx662_ag4_test0 --dataset /opt/datasets/IMX662 --weights checkpoints/best.pth --quick
         cp checkpoints/best.pth "checkpoints/run_${tag}_${i}.pth"
     done
     } > >(tee "run_${tag}.txt") 2>&1
@@ -27,4 +27,4 @@ run_training() {
 
 # Example: run_training 20 "1 2" "1 1 2"
 
-run_training 32 "2" "1 1" 10
+run_training 128 "2 2" "2 2 2" 5
