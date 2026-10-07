@@ -81,26 +81,37 @@ def _pack_frame(frame: torch.Tensor, wl: torch.Tensor) -> torch.Tensor:
     return space_to_depth(_split(frame) / wl, 2)
 
 
+def _to_wb(x: torch.Tensor, channel_gains: torch.Tensor) -> torch.Tensor:
+    """(B, 16, H/4, W/4) normalised, packed Bayer -> white-balanced, gamma-corrected
+    space (the space the loss works in). channel_gains: (B, 16) per-channel WB gains."""
+    gains = channel_gains.view(-1, 16, 1, 1)
+    eps = 1e-6
+    return (torch.clamp(x * gains, 0.0, 1.0) + eps) ** (1 / 2.2)
+
+
 def _loss(
     pred: torch.Tensor,
     gt_ch: torch.Tensor,
     channel_gains: torch.Tensor,
+    weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """MSE loss in white-balanced, gamma-corrected space. Same as train.py's _loss.
 
     Args:
         pred, gt_ch:    (B, 16, H/4, W/4) normalised, packed Bayer tensors.
         channel_gains:  (B, 16) per-channel WB gains.
+        weight:         optional (B, 16, H/4, W/4) per-pixel weight on the L1
+                        term (not normalised, so weight 1 everywhere is the
+                        plain loss). The SSIM term is unweighted.
     """
-    gains   = channel_gains.view(-1, 16, 1, 1)
-    eps = 1e-6
-    pred_wb = (torch.clamp(pred  * gains, 0.0, 1.0) + eps) ** (1 / 2.2)
-    gt_wb   = (torch.clamp(gt_ch * gains, 0.0, 1.0) + eps) ** (1 / 2.2)
-    return 100.0 * ((1.0 - ssim(pred_wb, gt_wb, data_range=1.0)) + 6 * F.l1_loss(pred_wb, gt_wb))
+    pred_wb = _to_wb(pred,  channel_gains)
+    gt_wb   = _to_wb(gt_ch, channel_gains)
+    l1 = F.l1_loss(pred_wb, gt_wb) if weight is None else (weight * (pred_wb - gt_wb).abs()).mean()
+    return 100.0 * ((1.0 - ssim(pred_wb, gt_wb, data_range=1.0)) + 6 * l1)
 
 
 def _run_sequence(
-    model: DenoiseNet, batch: dict, device: torch.device,
+    model: DenoiseNet, batch: dict, device: torch.device, diff_weight: float = 0.0,
 ) -> torch.Tensor:
     """Run BPTT over one batch of T-frame sequences, returning the mean per-frame loss.
 
@@ -109,6 +120,11 @@ def _run_sequence(
     packed input (zeros for the first frame); no detaching between frames,
     so gradients flow through the whole sequence (true BPTT -- T is only
     10-15, so this is the whole window, not a truncation).
+
+    With diff_weight > 0, each pixel's L1 loss (from the second frame on) is
+    weighted by 1 + diff_weight * |gt_t - gt_{t-1}| (in the loss's WB/gamma
+    space), to emphasise regions where the scene changed and the previous
+    output must not be trusted (e.g. detail being occluded).
     """
     wl = batch["white_level"].float().to(device).view(-1, 1, 1, 1)
     noisy_seq = batch["noisy"].to(device)  # (B, T, H, W)
@@ -117,6 +133,7 @@ def _run_sequence(
 
     T = noisy_seq.shape[1]
     prev_output = None
+    gt_prev = None
     total_loss = 0.0
     for t in range(T):
         x_t  = _pack_frame(noisy_seq[:, t], wl)
@@ -124,8 +141,13 @@ def _run_sequence(
         if prev_output is None:
             prev_output = torch.zeros_like(x_t)
         pred = model(torch.cat([x_t, prev_output], dim=1))
-        total_loss = total_loss + _loss(pred, gt_t, cg)
+        weight = None
+        if diff_weight > 0 and gt_prev is not None:
+            with torch.no_grad():
+                weight = 1.0 + diff_weight * (_to_wb(gt_t, cg) - _to_wb(gt_prev, cg)).abs()
+        total_loss = total_loss + _loss(pred, gt_t, cg, weight)
         prev_output = pred
+        gt_prev = gt_t
 
     return total_loss / T
 
@@ -153,6 +175,10 @@ def main() -> None:
                               "at a multiple of this stride, per epoch (e.g. "
                               "--seq-len 10 --window-stride 5 starts at 0, 5, "
                               "10, ...); 0 = one randomly placed window per tile")
+    parser.add_argument("--diff-weight",  type=float, default=0.0,
+                         help="weight each pixel's L1 loss by 1 + K * |gt_t - gt_{t-1}| "
+                              "(WB/gamma space), emphasising regions where the scene "
+                              "changed; 0 disables it")
     parser.add_argument("--resume",       default=None, metavar="WEIGHTS")
     parser.add_argument("--lr",           type=float, default=1e-3)
     parser.add_argument("--lr-min",       type=float, default=1e-5)
@@ -218,6 +244,7 @@ def main() -> None:
     macs = _macs_per_pixel(model, patch_size=args.patch_size)
     rf = _receptive_field(model)
     print(f"Model parameters: {n_params:,}  MACs/pixel: {macs:,}  RF: {rf}×{rf}px")
+    print(f"GT-difference loss weight: {args.diff_weight}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = ReduceLROnPlateau(
@@ -235,7 +262,7 @@ def main() -> None:
         train_loss = 0.0
         for batch in tqdm(train_loader, desc=f"Epoch {epoch}", leave=False, disable=args.no_pbar):
             optimizer.zero_grad()
-            loss = _run_sequence(model, batch, device)
+            loss = _run_sequence(model, batch, device, args.diff_weight)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -266,7 +293,7 @@ def main() -> None:
         val_loss = 0.0
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="Val", leave=False, disable=args.no_pbar):
-                val_loss += _run_sequence(model, batch, device).item()
+                val_loss += _run_sequence(model, batch, device, args.diff_weight).item()
         val_loss /= len(val_loader)
 
         elapsed = round(time.time() - t0)
@@ -275,7 +302,8 @@ def main() -> None:
         if improved:
             best_val = val_loss
             torch.save(
-                {"state_dict": model.state_dict(), "ch": model.ch, "scaling_factors": model.scaling_factors, "num_encoders": model.num_encoders},
+                {"state_dict": model.state_dict(), "ch": model.ch, "scaling_factors": model.scaling_factors, "num_encoders": model.num_encoders,
+                 "diff_weight": args.diff_weight},
                 "checkpoints/best_temporal.pth",
             )
         tag = f"  -> improved: {val_loss:.5f}" if improved else ""

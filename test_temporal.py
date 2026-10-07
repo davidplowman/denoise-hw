@@ -8,6 +8,11 @@ PNGs per frame and prints PSNR/SSIM against ground truth.
 With --still-checkpoint, also runs the single-image (non-temporal) DenoiseNet
 on exactly the same noisy frames, writing <N>_still.png and reporting its
 PSNR/SSIM alongside, for comparison.
+
+With --change-threshold, also reports PSNR over only the pixels where the GT
+changed from the previous frame by more than the threshold (measured in the
+training loss's white-balanced, gamma-corrected space, max over the packed
+channels) -- this is where ghosting from the previous output shows up.
 """
 
 from __future__ import annotations
@@ -26,6 +31,7 @@ from dataset_temporal import frame_paths
 from denoisenet_temporal import DenoiseNet, depth_to_space, space_to_depth
 from dng import DNG
 from network import DenoiseNet as StillDenoiseNet
+from train_temporal import _to_wb
 
 _SENSOR_NAME = "imx662"
 
@@ -81,6 +87,11 @@ def main() -> None:
     parser.add_argument("--dataset", default="/opt/datasets/IMX662_temporal", metavar="ROOT")
     parser.add_argument("--seed", type=int, default=None,
                          help="seed for the noise/defect-map RNG (default: unseeded)")
+    parser.add_argument("--change-threshold", type=float, default=None, metavar="T",
+                         help="also report PSNR over pixels where |gt_t - gt_{t-1}| > T "
+                              "(WB/gamma space, as in the training loss)")
+    parser.add_argument("--save-masks", action="store_true",
+                         help="with --change-threshold, write <N>_mask.png for each frame")
     args = parser.parse_args()
 
     clip_dir = Path(args.dataset) / args.clip
@@ -108,13 +119,32 @@ def main() -> None:
 
     # scores[(output, reference)] = list of per-frame (PSNR, SSIM)
     scores: dict[tuple[str, str], list[tuple[float, float]]] = {}
+    # changed[(output, reference)] = [squared error sum, sample count], pooled
+    # over the changed-region pixels of all frames
+    changed: dict[tuple[str, str], list[float]] = {}
+    changed_pixels = [0, 0]  # [masked, total] over frames with a previous frame
 
-    def score(name: str, ref_name: str, ref_rgb: np.ndarray, rgb: np.ndarray) -> None:
+    def score(name: str, ref_name: str, ref_rgb: np.ndarray, rgb: np.ndarray,
+              mask: np.ndarray | None) -> None:
         p = psnr(ref_rgb, rgb, data_range=65535)
         s = ssim(ref_rgb, rgb, data_range=65535, channel_axis=2)
         scores.setdefault((name, ref_name), []).append((p, s))
-        print(f"  frame {num}  PSNR {p:8.3f}  SSIM {s:8.4f}  ({name} vs {ref_name})")
+        extra = ""
+        if mask is not None:
+            acc = changed.setdefault((name, ref_name), [0.0, 0])
+            n = int(mask.sum())
+            if n:
+                err = (ref_rgb[mask].astype(np.float64) - rgb[mask]) ** 2
+                acc[0] += err.sum()
+                acc[1] += err.size
+                extra = f"  changed PSNR {10 * np.log10(65535 ** 2 / err.mean()):8.3f}"
+            else:
+                extra = "  changed PSNR        —"
+            extra += f" ({100 * n / mask.size:5.2f}%)"
+        print(f"  frame {num}  PSNR {p:8.3f}  SSIM {s:8.4f}{extra}  ({name} vs {ref_name})")
 
+    channel_gains = None  # (1, 16), from the first frame, as in training
+    prev_gt_wb = None
     prev_output = None
 
     for dp in dng_paths:
@@ -148,6 +178,27 @@ def main() -> None:
         noisy_rgb = gt_dng.to_rgb(bayer=noisy_signal, subtract_black_level=False, output_bps=16)
         pred_rgb  = gt_dng.to_rgb(bayer=pred_bayer, output_bps=16)
 
+        mask = None
+        if args.change_threshold is not None:
+            if channel_gains is None:
+                cidx = {'R': 0, 'G': 1, 'B': 2}
+                g4 = torch.tensor([gt_dng.wb_gains[cidx[gt_dng.bayer_pattern[k]]] for k in range(4)],
+                                  dtype=torch.float32)
+                channel_gains = g4.repeat_interleave(4).unsqueeze(0)
+            gt_wb = _to_wb(_pack(gt_dng.bayer, gt_dng.white_level), channel_gains)
+            if prev_gt_wb is not None:
+                diff = (gt_wb - prev_gt_wb).abs().amax(dim=1)[0].numpy()  # (H/4, W/4)
+                mask = np.repeat(np.repeat(diff > args.change_threshold, 4, axis=0), 4, axis=1)
+                assert mask.shape == gt_rgb.shape[:2], \
+                    f"mask {mask.shape} doesn't match RGB {gt_rgb.shape[:2]}"
+                changed_pixels[0] += int(mask.sum())
+                changed_pixels[1] += mask.size
+                if args.save_masks:
+                    path = out / f"{num}_mask.png"
+                    cv2.imwrite(str(path), mask.astype(np.uint8) * 255)
+                    print(f"  {path}")
+            prev_gt_wb = gt_wb
+
         _save_png(gt_rgb,    out / f"{num}_gt.png")
         _save_png(noisy_rgb, out / f"{num}_noisy.png")
         _save_png(pred_rgb,  out / f"{num}_pred.png")
@@ -162,12 +213,20 @@ def main() -> None:
             outputs.append(("still", still_rgb))
 
         for name, rgb in outputs:
-            score(name, "gt", gt_rgb, rgb)
+            score(name, "gt", gt_rgb, rgb, mask)
 
     print(f"\nMean over {len(dng_paths)} frames:")
     for (name, ref_name), vals in scores.items():
         p, s = np.mean(vals, axis=0)
         print(f"  PSNR {p:8.3f}  SSIM {s:8.4f}  ({name} vs {ref_name})")
+
+    if args.change_threshold is not None and changed_pixels[1]:
+        print(f"\nChanged regions (threshold {args.change_threshold}, "
+              f"{100 * changed_pixels[0] / changed_pixels[1]:.2f}% of pixels, "
+              f"pooled from the second frame onwards):")
+        for (name, ref_name), (sq_err, count) in changed.items():
+            p = f"{10 * np.log10(65535 ** 2 * count / sq_err):8.3f}" if count else "       —"
+            print(f"  PSNR {p}  ({name} vs {ref_name})")
 
 if __name__ == "__main__":
     main()
