@@ -13,6 +13,15 @@ With --change-threshold, also reports PSNR over only the pixels where the GT
 changed from the previous frame by more than the threshold (measured in the
 training loss's white-balanced, gamma-corrected space, max over the packed
 channels) -- this is where ghosting from the previous output shows up.
+
+From the second frame on, also reports a flicker measure for each output,
+mean |(pred_t - pred_{t-1}) - (gt_t - gt_{t-1})| in the same space (the
+training script's --temporal-weight term), and in the summary the raw
+frame-to-frame differences mean |pred_t - pred_{t-1}| and |gt_t - gt_{t-1}|,
+so the GT's own flicker can be compared with the output's on static clips.
+All three are computed after averaging the differences over
+--flicker-scale x --flicker-scale raw pixels (same-colour samples), which
+suppresses pixel-level noise and measures the more visible blobby shimmer.
 """
 
 from __future__ import annotations
@@ -31,7 +40,7 @@ from dataset_temporal import frame_paths
 from denoisenet_temporal import DenoiseNet, depth_to_space, space_to_depth
 from dng import DNG
 from network import DenoiseNet as StillDenoiseNet
-from train_temporal import _to_wb
+from train_temporal import _smooth, _to_wb
 
 _SENSOR_NAME = "imx662"
 
@@ -90,9 +99,15 @@ def main() -> None:
     parser.add_argument("--change-threshold", type=float, default=None, metavar="T",
                          help="also report PSNR over pixels where |gt_t - gt_{t-1}| > T "
                               "(WB/gamma space, as in the training loss)")
+    parser.add_argument("--flicker-scale", type=int, default=4, metavar="K",
+                         help="average frame-to-frame differences over K x K raw pixels "
+                              "before measuring flicker (1 or even; 1 = no smoothing)")
     parser.add_argument("--save-masks", action="store_true",
                          help="with --change-threshold, write <N>_mask.png for each frame")
     args = parser.parse_args()
+    if args.flicker_scale != 1 and (args.flicker_scale < 2 or args.flicker_scale % 2):
+        parser.error("--flicker-scale must be 1 or an even number")
+    k = args.flicker_scale
 
     clip_dir = Path(args.dataset) / args.clip
     out = Path(args.output)
@@ -123,9 +138,12 @@ def main() -> None:
     # over the changed-region pixels of all frames
     changed: dict[tuple[str, str], list[float]] = {}
     changed_pixels = [0, 0]  # [masked, total] over frames with a previous frame
+    # flicker[output] = per-frame (consistency term, mean |pred_t - pred_{t-1}|)
+    flicker: dict[str, list[tuple[float, float]]] = {}
+    gt_deltas: list[float] = []  # per-frame mean |gt_t - gt_{t-1}|
 
     def score(name: str, ref_name: str, ref_rgb: np.ndarray, rgb: np.ndarray,
-              mask: np.ndarray | None) -> None:
+              mask: np.ndarray | None, flick: float | None) -> None:
         p = psnr(ref_rgb, rgb, data_range=65535)
         s = ssim(ref_rgb, rgb, data_range=65535, channel_axis=2)
         scores.setdefault((name, ref_name), []).append((p, s))
@@ -141,10 +159,13 @@ def main() -> None:
             else:
                 extra = "  changed PSNR        —"
             extra += f" ({100 * n / mask.size:5.2f}%)"
+        if flick is not None:
+            extra += f"  flicker@{k} {flick:.5f}"
         print(f"  frame {num}  PSNR {p:8.3f}  SSIM {s:8.4f}{extra}  ({name} vs {ref_name})")
 
     channel_gains = None  # (1, 16), from the first frame, as in training
     prev_gt_wb = None
+    prev_pred_wb: dict[str, torch.Tensor] = {}
     prev_output = None
 
     for dp in dng_paths:
@@ -178,16 +199,22 @@ def main() -> None:
         noisy_rgb = gt_dng.to_rgb(bayer=noisy_signal, subtract_black_level=False, output_bps=16)
         pred_rgb  = gt_dng.to_rgb(bayer=pred_bayer, output_bps=16)
 
+        # GT in the training loss's WB/gamma packed space, for the
+        # changed-region mask and the flicker measure
+        if channel_gains is None:
+            cidx = {'R': 0, 'G': 1, 'B': 2}
+            g4 = torch.tensor([gt_dng.wb_gains[cidx[gt_dng.bayer_pattern[k]]] for k in range(4)],
+                              dtype=torch.float32)
+            channel_gains = g4.repeat_interleave(4).unsqueeze(0)
+        gt_wb = _to_wb(_pack(gt_dng.bayer, gt_dng.white_level), channel_gains)
+        gt_delta = None if prev_gt_wb is None else gt_wb - prev_gt_wb
+        if gt_delta is not None:
+            gt_deltas.append(_smooth(gt_delta, k).abs().mean().item())
+
         mask = None
         if args.change_threshold is not None:
-            if channel_gains is None:
-                cidx = {'R': 0, 'G': 1, 'B': 2}
-                g4 = torch.tensor([gt_dng.wb_gains[cidx[gt_dng.bayer_pattern[k]]] for k in range(4)],
-                                  dtype=torch.float32)
-                channel_gains = g4.repeat_interleave(4).unsqueeze(0)
-            gt_wb = _to_wb(_pack(gt_dng.bayer, gt_dng.white_level), channel_gains)
-            if prev_gt_wb is not None:
-                diff = (gt_wb - prev_gt_wb).abs().amax(dim=1)[0].numpy()  # (H/4, W/4)
+            if gt_delta is not None:
+                diff = gt_delta.abs().amax(dim=1)[0].numpy()  # (H/4, W/4)
                 mask = np.repeat(np.repeat(diff > args.change_threshold, 4, axis=0), 4, axis=1)
                 assert mask.shape == gt_rgb.shape[:2], \
                     f"mask {mask.shape} doesn't match RGB {gt_rgb.shape[:2]}"
@@ -197,23 +224,30 @@ def main() -> None:
                     path = out / f"{num}_mask.png"
                     cv2.imwrite(str(path), mask.astype(np.uint8) * 255)
                     print(f"  {path}")
-            prev_gt_wb = gt_wb
+        prev_gt_wb = gt_wb
 
         _save_png(gt_rgb,    out / f"{num}_gt.png")
         _save_png(noisy_rgb, out / f"{num}_noisy.png")
         _save_png(pred_rgb,  out / f"{num}_pred.png")
 
-        outputs = [("temporal", pred_rgb)]
+        outputs = [("temporal", pred_rgb, pred)]
         if still_model is not None:
             with torch.no_grad():
                 still_pred = still_model(x)
             still_bayer = _unpack(still_pred, gt_dng.white_level, gt_dng.bayer.shape)
             still_rgb = gt_dng.to_rgb(bayer=still_bayer, output_bps=16)
             _save_png(still_rgb, out / f"{num}_still.png")
-            outputs.append(("still", still_rgb))
+            outputs.append(("still", still_rgb, still_pred))
 
-        for name, rgb in outputs:
-            score(name, "gt", gt_rgb, rgb, mask)
+        for name, rgb, packed in outputs:
+            pred_wb = _to_wb(packed, channel_gains)
+            flick = None
+            if gt_delta is not None:
+                pred_delta = _smooth(pred_wb - prev_pred_wb[name], k)
+                flick = (pred_delta - _smooth(gt_delta, k)).abs().mean().item()
+                flicker.setdefault(name, []).append((flick, pred_delta.abs().mean().item()))
+            prev_pred_wb[name] = pred_wb
+            score(name, "gt", gt_rgb, rgb, mask, flick)
 
     print(f"\nMean over {len(dng_paths)} frames:")
     for (name, ref_name), vals in scores.items():
@@ -227,6 +261,14 @@ def main() -> None:
         for (name, ref_name), (sq_err, count) in changed.items():
             p = f"{10 * np.log10(65535 ** 2 * count / sq_err):8.3f}" if count else "       —"
             print(f"  PSNR {p}  ({name} vs {ref_name})")
+
+    if gt_deltas:
+        print(f"\nFrame-to-frame differences (WB/gamma space, averaged over {k}x{k} raw pixels, "
+              f"mean from the second frame onwards):")
+        print(f"  |gt_t - gt_t-1|     {np.mean(gt_deltas):.5f}")
+        for name, vals in flicker.items():
+            f, d = np.mean(vals, axis=0)
+            print(f"  |pred_t - pred_t-1| {d:.5f}  flicker@{k} {f:.5f}  ({name})")
 
 if __name__ == "__main__":
     main()

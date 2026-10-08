@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from dataset_temporal import load_datasets, worker_init_fn
-from denoisenet_temporal import DenoiseNet, space_to_depth
+from denoisenet_temporal import DenoiseNet, depth_to_space, space_to_depth
 
 
 def _receptive_field(model: DenoiseNet, h: int = 128) -> int:
@@ -89,29 +89,39 @@ def _to_wb(x: torch.Tensor, channel_gains: torch.Tensor) -> torch.Tensor:
     return (torch.clamp(x * gains, 0.0, 1.0) + eps) ** (1 / 2.2)
 
 
+def _smooth(x: torch.Tensor, k: int) -> torch.Tensor:
+    """Spatially average a (B, 16, H/4, W/4) packed tensor over k x k raw pixels.
+
+    The packing is undone first, so each average is over same-colour Bayer
+    samples: returns (B, 4, H/k, W/k) colour planes (non-overlapping average).
+    k must be 1 (no smoothing; x is returned as is) or even.
+    """
+    if k == 1:
+        return x
+    return F.avg_pool2d(depth_to_space(x, 2), k // 2)
+
+
 def _loss(
-    pred: torch.Tensor,
-    gt_ch: torch.Tensor,
-    channel_gains: torch.Tensor,
+    pred_wb: torch.Tensor,
+    gt_wb: torch.Tensor,
     weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """MSE loss in white-balanced, gamma-corrected space. Same as train.py's _loss.
+    """Loss in white-balanced, gamma-corrected space. Same as train.py's _loss.
 
     Args:
-        pred, gt_ch:    (B, 16, H/4, W/4) normalised, packed Bayer tensors.
-        channel_gains:  (B, 16) per-channel WB gains.
+        pred_wb, gt_wb: (B, 16, H/4, W/4) packed tensors, already in WB/gamma
+                        space (see _to_wb).
         weight:         optional (B, 16, H/4, W/4) per-pixel weight on the L1
                         term (not normalised, so weight 1 everywhere is the
                         plain loss). The SSIM term is unweighted.
     """
-    pred_wb = _to_wb(pred,  channel_gains)
-    gt_wb   = _to_wb(gt_ch, channel_gains)
     l1 = F.l1_loss(pred_wb, gt_wb) if weight is None else (weight * (pred_wb - gt_wb).abs()).mean()
     return 100.0 * ((1.0 - ssim(pred_wb, gt_wb, data_range=1.0)) + 6 * l1)
 
 
 def _run_sequence(
     model: DenoiseNet, batch: dict, device: torch.device, diff_weight: float = 0.0,
+    temporal_weight: float = 0.0, temporal_start: int = 1, flicker_scale: int = 4,
 ) -> torch.Tensor:
     """Run BPTT over one batch of T-frame sequences, returning the mean per-frame loss.
 
@@ -125,6 +135,16 @@ def _run_sequence(
     weighted by 1 + diff_weight * |gt_t - gt_{t-1}| (in the loss's WB/gamma
     space), to emphasise regions where the scene changed and the previous
     output must not be trusted (e.g. detail being occluded).
+
+    With temporal_weight > 0, frames from temporal_start on also get a
+    frame-to-frame consistency term,
+    |(pred_t - pred_{t-1}) - (gt_t - gt_{t-1})| = |err_t - err_{t-1}|, which
+    penalises changes in the error (scintillation) but not genuine scene
+    changes. Skipping the first few frames avoids penalising the large,
+    wanted drop in error while the recurrence converges. Both differences are
+    first averaged over flicker_scale x flicker_scale raw pixels (see _smooth),
+    which suppresses the GT's own pixel-level noise and targets the blobby
+    shimmer that is most visible.
     """
     wl = batch["white_level"].float().to(device).view(-1, 1, 1, 1)
     noisy_seq = batch["noisy"].to(device)  # (B, T, H, W)
@@ -133,7 +153,7 @@ def _run_sequence(
 
     T = noisy_seq.shape[1]
     prev_output = None
-    gt_prev = None
+    pred_wb_prev = gt_wb_prev = None
     total_loss = 0.0
     for t in range(T):
         x_t  = _pack_frame(noisy_seq[:, t], wl)
@@ -141,13 +161,19 @@ def _run_sequence(
         if prev_output is None:
             prev_output = torch.zeros_like(x_t)
         pred = model(torch.cat([x_t, prev_output], dim=1))
+        pred_wb = _to_wb(pred, cg)
+        gt_wb   = _to_wb(gt_t, cg)
         weight = None
-        if diff_weight > 0 and gt_prev is not None:
-            with torch.no_grad():
-                weight = 1.0 + diff_weight * (_to_wb(gt_t, cg) - _to_wb(gt_prev, cg)).abs()
-        total_loss = total_loss + _loss(pred, gt_t, cg, weight)
+        if diff_weight > 0 and gt_wb_prev is not None:
+            weight = 1.0 + diff_weight * (gt_wb - gt_wb_prev).abs()
+        total_loss = total_loss + _loss(pred_wb, gt_wb, weight)
+        if temporal_weight > 0 and t >= temporal_start:
+            # pred_wb_prev is not detached: gradients reach both frames.
+            tc = (_smooth(pred_wb - pred_wb_prev, flicker_scale)
+                  - _smooth(gt_wb - gt_wb_prev, flicker_scale)).abs().mean()
+            total_loss = total_loss + 100.0 * temporal_weight * tc
         prev_output = pred
-        gt_prev = gt_t
+        pred_wb_prev, gt_wb_prev = pred_wb, gt_wb
 
     return total_loss / T
 
@@ -179,6 +205,16 @@ def main() -> None:
                          help="weight each pixel's L1 loss by 1 + K * |gt_t - gt_{t-1}| "
                               "(WB/gamma space), emphasising regions where the scene "
                               "changed; 0 disables it")
+    parser.add_argument("--temporal-weight", type=float, default=0.0,
+                         help="weight of the frame-to-frame consistency term "
+                              "|(pred_t - pred_{t-1}) - (gt_t - gt_{t-1})| (WB/gamma "
+                              "space; the L1 term's weight is 6); 0 disables it")
+    parser.add_argument("--temporal-start", type=int, default=1,
+                         help="first frame (0-based) the consistency term applies to; "
+                              "skipping a few frames avoids penalising convergence")
+    parser.add_argument("--flicker-scale", type=int, default=4,
+                         help="average the consistency term's frame differences over "
+                              "K x K raw pixels first (1 or even; 1 = no smoothing)")
     parser.add_argument("--resume",       default=None, metavar="WEIGHTS")
     parser.add_argument("--lr",           type=float, default=1e-3)
     parser.add_argument("--lr-min",       type=float, default=1e-5)
@@ -194,6 +230,10 @@ def main() -> None:
     args = parser.parse_args()
     if not 0 < args.gain_min <= args.gain_max:
         parser.error("need 0 < --gain-min <= --gain-max")
+    if args.temporal_start < 1:
+        parser.error("--temporal-start must be at least 1 (frame 0 has no previous frame)")
+    if args.flicker_scale != 1 and (args.flicker_scale < 2 or args.flicker_scale % 2):
+        parser.error("--flicker-scale must be 1 or an even number")
     if args.scaling is not None:
         args.scaling = [int(v) for v in args.scaling.split()]
 
@@ -244,7 +284,9 @@ def main() -> None:
     macs = _macs_per_pixel(model, patch_size=args.patch_size)
     rf = _receptive_field(model)
     print(f"Model parameters: {n_params:,}  MACs/pixel: {macs:,}  RF: {rf}×{rf}px")
+    print(f"Gain min: {args.gain_min} max: {args.gain_max}")
     print(f"GT-difference loss weight: {args.diff_weight}")
+    print(f"Temporal consistency weight: {args.temporal_weight}  (from frame {args.temporal_start}, scale {args.flicker_scale})")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = ReduceLROnPlateau(
@@ -262,7 +304,8 @@ def main() -> None:
         train_loss = 0.0
         for batch in tqdm(train_loader, desc=f"Epoch {epoch}", leave=False, disable=args.no_pbar):
             optimizer.zero_grad()
-            loss = _run_sequence(model, batch, device, args.diff_weight)
+            loss = _run_sequence(model, batch, device, args.diff_weight,
+                                 args.temporal_weight, args.temporal_start, args.flicker_scale)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -293,7 +336,8 @@ def main() -> None:
         val_loss = 0.0
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="Val", leave=False, disable=args.no_pbar):
-                val_loss += _run_sequence(model, batch, device, args.diff_weight).item()
+                val_loss += _run_sequence(model, batch, device, args.diff_weight,
+                                            args.temporal_weight, args.temporal_start, args.flicker_scale).item()
         val_loss /= len(val_loader)
 
         elapsed = round(time.time() - t0)
@@ -303,7 +347,9 @@ def main() -> None:
             best_val = val_loss
             torch.save(
                 {"state_dict": model.state_dict(), "ch": model.ch, "scaling_factors": model.scaling_factors, "num_encoders": model.num_encoders,
-                 "diff_weight": args.diff_weight},
+                 "diff_weight": args.diff_weight,
+                 "temporal_weight": args.temporal_weight, "temporal_start": args.temporal_start,
+                 "flicker_scale": args.flicker_scale},
                 "checkpoints/best_temporal.pth",
             )
         tag = f"  -> improved: {val_loss:.5f}" if improved else ""
