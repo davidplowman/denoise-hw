@@ -84,6 +84,13 @@ class TemporalPatchDataset:
     at 0, 5, 10, 15, 20. Any leftover frames (when the stride doesn't divide
     num_frames - seq_len) are used by shifting each window by a random
     amount (up to the leftover count) on each draw.
+
+    With fixed_seed set (used for validation), every item is instead the
+    same on every call and in every DataLoader worker: its randomness comes
+    from an RNG seeded by (fixed_seed, item index), and its gain is taken
+    from a log-spaced grid over [gain_min, gain_max] (one grid point per
+    item, assigned in a seeded random order), so the set covers the gain
+    range evenly and is identical across epochs and runs.
     """
 
     def __init__(
@@ -97,6 +104,7 @@ class TemporalPatchDataset:
         gain_min: float = 4.0,
         gain_max: float = 400.0,
         window_stride: int = 0,
+        fixed_seed: int | None = None,
     ) -> None:
         self._records = records
         self._clips = clips
@@ -119,6 +127,14 @@ class TemporalPatchDataset:
             else:
                 self._items.append((i, None))
 
+        self._fixed_seed = fixed_seed
+        self._fixed_gains = None
+        if fixed_seed is not None:
+            n = len(self._items)
+            order = np.random.default_rng([fixed_seed, n]).permutation(n)
+            log_g = self._log_gain_min + (order + 0.5) / n * (self._log_gain_max - self._log_gain_min)
+            self._fixed_gains = 10 ** log_g
+
     def reseed(self, seed: int) -> None:
         """Re-seed the sampling RNG (call from a DataLoader worker_init_fn)."""
         self._rng = np.random.default_rng(seed)
@@ -135,16 +151,25 @@ class TemporalPatchDataset:
         T = self._seq_len
         num_frames = len(clip.frames)
 
+        if self._fixed_seed is None:
+            rng = self._rng
+        else:
+            rng = np.random.default_rng([self._fixed_seed, idx])
+
         if start is None:
-            offset = int(self._rng.integers(0, num_frames - T + 1))
+            offset = int(rng.integers(0, num_frames - T + 1))
         else:
             slack = (num_frames - T) % self._window_stride
-            offset = start + int(self._rng.integers(0, slack + 1))
-        gain = float(10 ** self._rng.uniform(self._log_gain_min, self._log_gain_max))
-        defects = synthetic_noise.make_defect_map(shape=(p, p))
+            offset = start + int(rng.integers(0, slack + 1))
+        if self._fixed_gains is None:
+            gain = float(10 ** rng.uniform(self._log_gain_min, self._log_gain_max))
+            defects = synthetic_noise.make_defect_map(shape=(p, p))
+        else:
+            gain = float(self._fixed_gains[idx])
+            defects = synthetic_noise.make_defect_map(shape=(p, p), seed=int(rng.integers(2**32)))
 
-        brighten = (self._gain_aug_prob > 0 and self._rng.random() < self._gain_aug_prob)
-        brighten_g = np.float32(self._rng.uniform(1.0, self._gain_aug_max)) if brighten else None
+        brighten = (self._gain_aug_prob > 0 and rng.random() < self._gain_aug_prob)
+        brighten_g = np.float32(rng.uniform(1.0, self._gain_aug_max)) if brighten else None
 
         wl = clip.white_level
         gt_frames = []
@@ -159,7 +184,7 @@ class TemporalPatchDataset:
 
             signal = gt_tile - bl
             pixel = signal + synthetic_noise.black_level(gain)
-            noisy_tile = synthetic_noise.add_noise(pixel, gain, self._rng, defects).astype(np.float32)
+            noisy_tile = synthetic_noise.add_noise(pixel, gain, rng, defects).astype(np.float32)
 
             gt_frames.append(gt_tile)
             noisy_frames.append(noisy_tile)
@@ -195,6 +220,7 @@ def load_datasets(
     gain_min: float = 4.0,
     gain_max: float = 400.0,
     window_stride: int = 0,
+    val_seed: int | None = 0,
 ) -> tuple[TemporalPatchDataset, TemporalPatchDataset]:
     """Load train and validation sequence datasets from a clip directory.
 
@@ -215,6 +241,10 @@ def load_datasets(
             randomly placed window per tile (see TemporalPatchDataset).
             Applies to both splits, after the split itself, so a tile's
             windows never straddle train and val.
+        val_seed: If not None, the validation set is fixed (identical every
+            epoch, in every worker and every run) with evenly log-spaced
+            gains; see TemporalPatchDataset's fixed_seed. None draws fresh
+            random validation sequences on every call, like training.
 
     Returns:
         (train_ds, val_ds) as TemporalPatchDataset instances.
@@ -279,5 +309,6 @@ def load_datasets(
     val_ds = TemporalPatchDataset(
         val_records, clips, patch_size, seq_len,
         gain_min=gain_min, gain_max=gain_max, window_stride=window_stride,
+        fixed_seed=val_seed,
     )
     return train_ds, val_ds

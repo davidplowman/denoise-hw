@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import math
 import time
 from pathlib import Path
@@ -99,6 +100,20 @@ def _smooth(x: torch.Tensor, k: int) -> torch.Tensor:
     if k == 1:
         return x
     return F.avg_pool2d(depth_to_space(x, 2), k // 2)
+
+
+def _ema_update(ema_model: torch.nn.Module, model: torch.nn.Module, decay: float, step: int) -> None:
+    """Move ema_model's weights towards model's: ema = d*ema + (1-d)*model.
+
+    The decay is ramped up from 0.1 at the first step towards `decay`, so
+    the EMA isn't dominated by the initial weights early in training.
+    """
+    d = min(decay, (1 + step) / (10 + step))
+    with torch.no_grad():
+        for e, p in zip(ema_model.parameters(), model.parameters()):
+            e.lerp_(p, 1.0 - d)
+        for e, b in zip(ema_model.buffers(), model.buffers()):
+            e.copy_(b)
 
 
 def _loss(
@@ -215,10 +230,16 @@ def main() -> None:
     parser.add_argument("--flicker-scale", type=int, default=4,
                          help="average the consistency term's frame differences over "
                               "K x K raw pixels first (1 or even; 1 = no smoothing)")
+    parser.add_argument("--ema",          type=float, default=0.95,
+                         help="decay of an exponential moving average of the weights; "
+                              "the EMA model is the one validated and saved (0 disables it)")
+    parser.add_argument("--val-seed",     type=int,   default=0,
+                         help="seed of the fixed, gain-stratified validation set "
+                              "(-1: random validation draws every epoch instead)")
     parser.add_argument("--resume",       default=None, metavar="WEIGHTS")
-    parser.add_argument("--lr",           type=float, default=1e-3)
+    parser.add_argument("--lr",           type=float, default=2e-3)
     parser.add_argument("--lr-min",       type=float, default=1e-5)
-    parser.add_argument("--lr-patience",  type=int,   default=20)
+    parser.add_argument("--lr-patience",  type=int,   default=10)
     parser.add_argument("--batch-size",   type=int,   default=16)
     parser.add_argument("--epochs",       type=int,   default=800)
     parser.add_argument("--no-pbar",      action="store_true")
@@ -228,6 +249,8 @@ def main() -> None:
                               "\"\" means no downscaling at all")
     parser.add_argument("--encoders", nargs="+", type=int, default=None)
     args = parser.parse_args()
+    if not 0 <= args.ema < 1:
+        parser.error("--ema must be in [0, 1)")
     if not 0 < args.gain_min <= args.gain_max:
         parser.error("need 0 < --gain-min <= --gain-max")
     if args.temporal_start < 1:
@@ -252,6 +275,7 @@ def main() -> None:
         gain_min=args.gain_min,
         gain_max=args.gain_max,
         window_stride=args.window_stride,
+        val_seed=None if args.val_seed < 0 else args.val_seed,
     )
     print(f"  train: {len(train_ds)} sequences,  val: {len(val_ds)} sequences  "
           f"(seq_len={args.seq_len}, patch_size={args.patch_size})")
@@ -287,6 +311,18 @@ def main() -> None:
     print(f"Gain min: {args.gain_min} max: {args.gain_max}")
     print(f"GT-difference loss weight: {args.diff_weight}")
     print(f"Temporal consistency weight: {args.temporal_weight}  (from frame {args.temporal_start}, scale {args.flicker_scale})")
+    print(f"Weight EMA decay: {args.ema or 'off'}  Validation: "
+          + ("random draws" if args.val_seed < 0 else f"fixed, gain-stratified (seed {args.val_seed})"))
+
+    def make_ema(m: DenoiseNet) -> DenoiseNet | None:
+        if not args.ema:
+            return None
+        e = copy.deepcopy(m)
+        e.requires_grad_(False)
+        return e
+
+    ema_model = make_ema(model)
+    step = 0
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = ReduceLROnPlateau(
@@ -309,6 +345,9 @@ def main() -> None:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            if ema_model is not None:
+                _ema_update(ema_model, model, args.ema, step)
+            step += 1
             train_loss += loss.item()
         train_loss /= len(train_loader)
 
@@ -328,15 +367,19 @@ def main() -> None:
                       f"no checkpoint yet, recreating model from scratch.")
             optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
             scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=args.lr_patience)
+            ema_model = make_ema(model)
+            step = 0
             continue
 
         consecutive_nans = 0
 
-        model.eval()
+        # validate (and save) the EMA weights when enabled
+        eval_model = ema_model if ema_model is not None else model
+        eval_model.eval()
         val_loss = 0.0
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="Val", leave=False, disable=args.no_pbar):
-                val_loss += _run_sequence(model, batch, device, args.diff_weight,
+                val_loss += _run_sequence(eval_model, batch, device, args.diff_weight,
                                             args.temporal_weight, args.temporal_start, args.flicker_scale).item()
         val_loss /= len(val_loader)
 
@@ -346,7 +389,7 @@ def main() -> None:
         if improved:
             best_val = val_loss
             torch.save(
-                {"state_dict": model.state_dict(), "ch": model.ch, "scaling_factors": model.scaling_factors, "num_encoders": model.num_encoders,
+                {"state_dict": eval_model.state_dict(), "ch": model.ch, "scaling_factors": model.scaling_factors, "num_encoders": model.num_encoders,
                  "diff_weight": args.diff_weight,
                  "temporal_weight": args.temporal_weight, "temporal_start": args.temporal_start,
                  "flicker_scale": args.flicker_scale},
