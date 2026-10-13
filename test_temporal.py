@@ -22,6 +22,10 @@ so the GT's own flicker can be compared with the output's on static clips.
 All three are computed after averaging the differences over
 --flicker-scale x --flicker-scale raw pixels (same-colour samples), which
 suppresses pixel-level noise and measures the more visible blobby shimmer.
+
+For models with a blended output or hidden state, --save-alpha and
+--save-state write the per-frame alpha and state maps as greyscale PNGs
+(0..1 -> 0..255, nearest-upscaled to full resolution), and print their means.
 """
 
 from __future__ import annotations
@@ -73,8 +77,12 @@ def _save_png(rgb: np.ndarray, path: Path) -> None:
 def _load_model(checkpoint: str, model_cls: type = DenoiseNet) -> torch.nn.Module:
     ckpt = torch.load(checkpoint, map_location="cpu")
     if isinstance(ckpt, dict) and "state_dict" in ckpt:
+        extra = {}
+        if model_cls is DenoiseNet:
+            extra = {k: ckpt[k] for k in ("state_ch", "feed_image", "state_gated", "blend_output")
+                     if k in ckpt}
         model = model_cls(ch=ckpt.get("ch"), scaling_factors=ckpt.get("scaling_factors"),
-                           num_encoders=ckpt.get("num_encoders"))
+                           num_encoders=ckpt.get("num_encoders"), **extra)
         model.load_state_dict(ckpt["state_dict"])
     else:
         model = model_cls()
@@ -104,6 +112,11 @@ def main() -> None:
                               "before measuring flicker (1 or even; 1 = no smoothing)")
     parser.add_argument("--save-masks", action="store_true",
                          help="with --change-threshold, write <N>_mask.png for each frame")
+    parser.add_argument("--save-alpha", action="store_true",
+                         help="with a blended-output model, write <N>_alpha.png for each frame")
+    parser.add_argument("--save-state", action="store_true",
+                         help="with a hidden-state model, write <N>_state<C>.png for each "
+                              "frame and state channel (and print the gate's mean if gated)")
     args = parser.parse_args()
     if args.flicker_scale != 1 and (args.flicker_scale < 2 or args.flicker_scale % 2):
         parser.error("--flicker-scale must be 1 or an even number")
@@ -121,7 +134,9 @@ def main() -> None:
     print(f"Output: {out}")
 
     model = _load_model(args.checkpoint)
-    print(f"Model: ch={model.ch}  scaling={model.scaling_factors}  encoders={model.num_encoders}")
+    print(f"Model: ch={model.ch}  scaling={model.scaling_factors}  encoders={model.num_encoders}  "
+          f"blend={model.blend_output}  feed_image={model.feed_image}  "
+          f"state_ch={model.state_ch}{' (gated)' if model.state_gated else ''}")
 
     still_model = None
     if args.still_checkpoint:
@@ -166,7 +181,13 @@ def main() -> None:
     channel_gains = None  # (1, 16), from the first frame, as in training
     prev_gt_wb = None
     prev_pred_wb: dict[str, torch.Tensor] = {}
-    prev_output = None
+    prev_output = state = None
+
+    def save_map(m: torch.Tensor, path: Path) -> None:
+        """(H/4, W/4) map in [0, 1] -> full-resolution 8-bit greyscale PNG."""
+        img = np.repeat(np.repeat(m.numpy(), 4, axis=0), 4, axis=1)
+        cv2.imwrite(str(path), np.round(np.clip(img, 0, 1) * 255).astype(np.uint8))
+        print(f"  {path}")
 
     for dp in dng_paths:
         num = dp.stem  # "00", "01", ...
@@ -181,11 +202,20 @@ def main() -> None:
         noisy_bayer = synthetic_noise.add_noise(pixel, args.gain, rng, defects).astype(np.uint16)
 
         x = _pack(noisy_bayer, gt_dng.white_level)
-        if prev_output is None:
-            prev_output = torch.zeros_like(x)
         with torch.no_grad():
-            pred = model(torch.cat([x, prev_output], dim=1))
+            pred, state, aux = model(x, prev_output, state, return_aux=True)
         prev_output = pred
+
+        if "alpha" in aux:
+            print(f"  frame {num}  mean alpha {aux['alpha'].mean().item():.4f}")
+            if args.save_alpha:
+                save_map(aux["alpha"][0, 0], out / f"{num}_alpha.png")
+        if "z" in aux:
+            print(f"  frame {num}  mean z {aux['z'].mean().item():.4f}  "
+                  f"(per channel: {' '.join(f'{v:.3f}' for v in aux['z'][0].mean(dim=(1, 2)).tolist())})")
+        if state is not None and args.save_state:
+            for c in range(state.shape[1]):
+                save_map(state[0, c], out / f"{num}_state{c}.png")
 
         pred_bayer = _unpack(pred, gt_dng.white_level, gt_dng.bayer.shape)
 

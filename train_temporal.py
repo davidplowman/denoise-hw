@@ -22,16 +22,19 @@ from denoisenet_temporal import DenoiseNet, depth_to_space, space_to_depth
 def _receptive_field(model: DenoiseNet, h: int = 128) -> int:
     """Estimate receptive field in full-resolution Bayer pixels via gradient backpropagation.
 
-    Same idea as train.py's version, but the model takes 32 input channels
-    (current frame + previous output) instead of 16 -- doesn't change the
-    spatial receptive-field calculation itself.
+    Same idea as train.py's version, measured from the current frame. The
+    previous output and state are fed in too (not the first frame), so every
+    head runs, but they go through the same 1x1 input conv and don't change
+    the spatial receptive field.
     """
     device = next(model.parameters()).device
-    x = torch.rand(1, 32, h, h, device=device, requires_grad=True)
+    x = torch.rand(1, 16, h, h, device=device, requires_grad=True)
+    prev = torch.rand(1, 16, h, h, device=device)
+    state = torch.rand(1, model.state_ch, h, h, device=device) if model.state_ch else None
     was_training = model.training
     model.eval()
     with torch.enable_grad():
-        out = model(x)
+        out, _ = model(x, prev, state)
     if was_training:
         model.train()
 
@@ -60,8 +63,11 @@ def _macs_per_pixel(model: DenoiseNet, patch_size: int = 256) -> int:
                for m in model.modules() if isinstance(m, torch.nn.Conv2d)]
     device = next(model.parameters()).device
     h = patch_size // 4
+    state = torch.zeros(1, model.state_ch, h, h, device=device) if model.state_ch else None
     with torch.no_grad():
-        model(torch.zeros(1, 32, h, h, device=device))
+        # not the first frame, so the blend (if any) runs too
+        model(torch.zeros(1, 16, h, h, device=device),
+              torch.zeros(1, 16, h, h, device=device), state)
     for hnd in handles:
         hnd.remove()
     return total // (patch_size * patch_size)
@@ -141,10 +147,11 @@ def _run_sequence(
     """Run BPTT over one batch of T-frame sequences, returning the mean per-frame loss.
 
     batch["noisy"]/batch["gt"]: (B, T, H, W) raw Bayer sequences.
-    The previous frame's *output* is concatenated onto the next frame's
-    packed input (zeros for the first frame); no detaching between frames,
-    so gradients flow through the whole sequence (true BPTT -- T is only
-    10-15, so this is the whole window, not a truncation).
+    The previous frame's *output* and hidden state (if any) are passed to
+    the model with the next frame (None for the first frame); no detaching
+    between frames, so gradients flow through the whole sequence (true BPTT
+    -- T is only 10-15, so this is the whole window, not a truncation).
+    The losses apply to the image output only.
 
     With diff_weight > 0, each pixel's L1 loss (from the second frame on) is
     weighted by 1 + diff_weight * |gt_t - gt_{t-1}| (in the loss's WB/gamma
@@ -167,15 +174,13 @@ def _run_sequence(
     cg = batch["channel_gains"].to(device).repeat_interleave(4, dim=1)  # (B, 16)
 
     T = noisy_seq.shape[1]
-    prev_output = None
+    prev_output = state = None
     pred_wb_prev = gt_wb_prev = None
     total_loss = 0.0
     for t in range(T):
         x_t  = _pack_frame(noisy_seq[:, t], wl)
         gt_t = _pack_frame(gt_seq[:, t], wl)
-        if prev_output is None:
-            prev_output = torch.zeros_like(x_t)
-        pred = model(torch.cat([x_t, prev_output], dim=1))
+        pred, state = model(x_t, prev_output, state)
         pred_wb = _to_wb(pred, cg)
         gt_wb   = _to_wb(gt_t, cg)
         weight = None
@@ -241,13 +246,25 @@ def main() -> None:
     parser.add_argument("--lr-min",       type=float, default=1e-5)
     parser.add_argument("--lr-patience",  type=int,   default=10)
     parser.add_argument("--batch-size",   type=int,   default=16)
-    parser.add_argument("--epochs",       type=int,   default=800)
+    parser.add_argument("--epochs",       type=int,   default=1000)
     parser.add_argument("--no-pbar",      action="store_true")
     parser.add_argument("--ch",      type=int,       default=None)
     parser.add_argument("--scaling", type=str, default=None,
                          help="space-separated scaling factors, e.g. \"2 2\"; "
                               "\"\" means no downscaling at all")
     parser.add_argument("--encoders", nargs="+", type=int, default=None)
+    # the four options below default to the --resume checkpoint's values
+    # (or to the original model's when not resuming)
+    parser.add_argument("--blend-output", action="store_true", default=None,
+                         help="output prev + alpha * (candidate - prev), with a learned "
+                              "per-pixel alpha")
+    parser.add_argument("--state-ch",     type=int,   default=None,
+                         help="number of hidden state channels carried between frames "
+                              "(0 = none)")
+    parser.add_argument("--state-gated",  action="store_true", default=None,
+                         help="gated hidden state update, h = z*h + (1-z)*c")
+    parser.add_argument("--no-feed-image", dest="feed_image", action="store_false", default=None,
+                         help="don't feed the previous output back in as input")
     args = parser.parse_args()
     if not 0 <= args.ema < 1:
         parser.error("--ema must be in [0, 1)")
@@ -281,12 +298,22 @@ def main() -> None:
           f"(seq_len={args.seq_len}, patch_size={args.patch_size})")
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size,
-                              shuffle=True,  num_workers=4, pin_memory=True,
+                              shuffle=True,  num_workers=16, pin_memory=True,
+                              persistent_workers=True,
                               worker_init_fn=worker_init_fn)
+    # a fixed validation set (--val-seed >= 0) is identical every epoch, so
+    # generate it once and keep the batches; random draws need the loader
+    fixed_val = args.val_seed >= 0
     val_loader   = DataLoader(val_ds,   batch_size=args.batch_size,
-                              shuffle=False, num_workers=4, pin_memory=True)
+                              persistent_workers=not fixed_val,
+                              shuffle=False, num_workers=16, pin_memory=True)
+    if fixed_val:
+        t0 = time.time()
+        val_loader = list(val_loader)
+        print(f"  cached {len(val_loader)} validation batches ({time.time() - t0:.1f}s)")
 
     state_dict = None
+    ckpt_cfg = {}
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device)
         if isinstance(ckpt, dict) and "state_dict" in ckpt:
@@ -296,18 +323,47 @@ def main() -> None:
                 args.scaling = ckpt.get("scaling_factors")
             if args.encoders is None:
                 args.encoders = ckpt.get("num_encoders")
+            ckpt_cfg = ckpt
             state_dict = ckpt["state_dict"]
         else:
             state_dict = ckpt
+    for key, default in (("blend_output", False), ("state_ch", 0),
+                         ("state_gated", False), ("feed_image", True)):
+        if getattr(args, key) is None:
+            setattr(args, key, ckpt_cfg.get(key, default))
+    if args.state_ch < 0:
+        parser.error("--state-ch must be non-negative")
+    if args.state_gated and not args.state_ch:
+        parser.error("--state-gated needs --state-ch > 0")
+    if not args.feed_image and args.blend_output:
+        print("WARNING: --no-feed-image with --blend-output: the network chooses alpha "
+              "without seeing the previous output it blends with (except via the state)")
+    if not args.feed_image and not args.state_ch:
+        print("WARNING: --no-feed-image with no state: the network gets nothing from "
+              "previous frames (only --blend-output can use them)")
 
-    model = DenoiseNet(ch=args.ch, scaling_factors=args.scaling, num_encoders=args.encoders).to(device)
+    def make_model() -> DenoiseNet:
+        return DenoiseNet(ch=args.ch, scaling_factors=args.scaling, num_encoders=args.encoders,
+                          state_ch=args.state_ch, feed_image=args.feed_image,
+                          state_gated=args.state_gated, blend_output=args.blend_output).to(device)
+
+    model = make_model()
     if state_dict is not None:
-        model.load_state_dict(state_dict)
-        print(f"Resumed from {args.resume}")
+        # non-strict, so a checkpoint without the new heads (e.g. the alpha
+        # head) can be fine-tuned; anything else not matching is an error
+        result = model.load_state_dict(state_dict, strict=False)
+        new_heads = ("alpha.", "state_c.", "state_z.")
+        bad = result.unexpected_keys + [k for k in result.missing_keys if not k.startswith(new_heads)]
+        if bad:
+            raise RuntimeError(f"checkpoint {args.resume} doesn't match the model: {bad}")
+        print(f"Resumed from {args.resume}"
+              + (f"  (newly initialised: {', '.join(result.missing_keys)})" if result.missing_keys else ""))
     n_params = sum(p.numel() for p in model.parameters())
     macs = _macs_per_pixel(model, patch_size=args.patch_size)
     rf = _receptive_field(model)
     print(f"Model parameters: {n_params:,}  MACs/pixel: {macs:,}  RF: {rf}×{rf}px")
+    print(f"Blend output: {args.blend_output}  Feed image: {args.feed_image}  "
+          f"State channels: {args.state_ch}" + ("  (gated)" if args.state_gated else ""))
     print(f"Gain min: {args.gain_min} max: {args.gain_max}")
     print(f"GT-difference loss weight: {args.diff_weight}")
     print(f"Temporal consistency weight: {args.temporal_weight}  (from frame {args.temporal_start}, scale {args.flicker_scale})")
@@ -350,13 +406,14 @@ def main() -> None:
             step += 1
             train_loss += loss.item()
         train_loss /= len(train_loader)
+        t_train = time.time() - t0
 
         if math.isnan(train_loss):
             consecutive_nans += 1
             if consecutive_nans >= 10:
                 print(f"Epoch {epoch}  NaN loss — {consecutive_nans} in a row, quitting.")
                 break
-            model = DenoiseNet(ch=args.ch, scaling_factors=args.scaling, num_encoders=args.encoders).to(device)
+            model = make_model()
             if best_val < float("inf"):
                 ckpt = torch.load("checkpoints/best_temporal.pth", map_location=device)
                 model.load_state_dict(ckpt["state_dict"])
@@ -382,6 +439,7 @@ def main() -> None:
                 val_loss += _run_sequence(eval_model, batch, device, args.diff_weight,
                                             args.temporal_weight, args.temporal_start, args.flicker_scale).item()
         val_loss /= len(val_loader)
+        t_val = time.time() - t0 - t_train
 
         elapsed = round(time.time() - t0)
         lr = optimizer.param_groups[0]["lr"]
@@ -392,11 +450,13 @@ def main() -> None:
                 {"state_dict": eval_model.state_dict(), "ch": model.ch, "scaling_factors": model.scaling_factors, "num_encoders": model.num_encoders,
                  "diff_weight": args.diff_weight,
                  "temporal_weight": args.temporal_weight, "temporal_start": args.temporal_start,
-                 "flicker_scale": args.flicker_scale},
+                 "flicker_scale": args.flicker_scale,
+                 "blend_output": model.blend_output, "state_ch": model.state_ch,
+                 "state_gated": model.state_gated, "feed_image": model.feed_image},
                 "checkpoints/best_temporal.pth",
             )
         tag = f"  -> improved: {val_loss:.5f}" if improved else ""
-        print(f"Epoch {epoch}  train {train_loss:.5f}  val {val_loss:.5f}  lr {lr:.2e}  {elapsed}s{tag}")
+        print(f"Epoch {epoch}  train {train_loss:.5f}  val {val_loss:.5f}  lr {lr:.2e}  {elapsed}s (train {t_train:.1f}s, val {t_val:.1f}s){tag}")
 
         scheduler.step(val_loss)
         if optimizer.param_groups[0]["lr"] <= args.lr_min:

@@ -2,12 +2,17 @@
 
 """Recurrent UNET-style Bayer denoiser, doing joint temporal + spatial denoising.
 
-Parallel copy of denoisenet.py (see temporal_plan.md): the only difference is
-that self.inp takes 32 input channels instead of 16 -- the current frame's 16
-packed channels concatenated with the previous frame's 16-channel output (or
-zeros for the first frame of a sequence). Everything else, including the
-residual skip connection (which uses only the current-frame half of the
-input), is unchanged.
+Parallel copy of denoisenet.py (see temporal_plan.md). By default the only
+difference is that self.inp takes 32 input channels instead of 16 -- the
+current frame's 16 packed channels concatenated with the previous frame's
+16-channel output (or zeros for the first frame of a sequence). Everything
+else, including the residual skip connection (which uses only the current
+frame), is unchanged.
+
+Optional extras (see DenoiseNet): blending the output with the previous one
+through a learned per-pixel factor, learned hidden state channels carried
+from frame to frame (optionally with a gated update), and not feeding the
+previous output back in at all.
 """
 
 import math
@@ -118,21 +123,39 @@ class DenoiseBlock(nn.Module):
 
 class DenoiseNet(nn.Module):
     """Recurrent Unet-style denoiser operating on space-to-depth-packed Bayer
-    values, with the previous frame's output fed back as extra input channels.
+    values, with the previous frame's output (and optionally a learned hidden
+    state) fed back as extra input channels.
 
-    Input to forward(): (B, 32, H/4, W/4) -- the current frame's 4 Bayer
-    channels, further packed 2x2 via space_to_depth(2) and normalised to
-    [0, 1] by white_level (channels 0:16), concatenated with the previous
-    frame's 16-channel output in the same packed/normalised space (channels
-    16:32), or zeros for the first frame of a sequence. The Bayer split,
-    packing, white_level normalisation, and previous-output concatenation
-    are all done by the caller -- none of it is part of this model.
+    forward(x, prev, h) takes:
+      x:    (B, 16, H/4, W/4) -- the current frame's 4 Bayer channels, further
+            packed 2x2 via space_to_depth(2) and normalised to [0, 1] by
+            white_level.
+      prev: the previous frame's output in the same packed/normalised space,
+            or None on the first frame of a sequence.
+      h:    the previous frame's hidden state, (B, state_ch, H/4, W/4) in
+            [0, 1], or None on the first frame.
+    The Bayer split, packing and white_level normalisation are done by the
+    caller -- none of it is part of this model. The network's input is the
+    concatenation [x, prev (if feed_image), h (if state_ch)], with zeros
+    standing in for prev and h on the first frame.
 
-    Output of forward(): (B, 16, H/4, W/4) -- denoised, still packed
-    (residual added directly in packed space, using only the current-frame
-    half of the input). The caller unpacks the result back to (B, 4, H/2, W/2)
-    with depth_to_space(2), and feeds it back as this same frame's
-    contribution to the *next* frame's input.
+    It returns (out, h_new):
+      out:   (B, 16, H/4, W/4) -- denoised, still packed. The candidate
+             s = x + residual (residual added directly in packed space). With
+             blend_output, out = prev + alpha * (s - prev), alpha being a
+             learned per-pixel factor in [0, 1] shared across the 16
+             channels; on the first frame out = s. The caller unpacks out
+             with depth_to_space(2) and passes it back as the next frame's
+             prev.
+      h_new: the new hidden state, or None when state_ch is 0. Ungated,
+             h_new = sigmoid(c); gated (state_gated), h_new = z * h + (1 - z)
+             * c with c = sigmoid(...) and z = sigmoid(...), so it stays in
+             [0, 1]. c, z and alpha all come from 1x1 heads on the final
+             decoder features; the blends happen outside the deep path.
+
+    The defaults (state_ch=0, feed_image=True, state_gated=False,
+    blend_output=False) reproduce the original 32-input-channel model, so
+    its checkpoints still load.
 
     scaling_factors controls subsampling between encoder levels: each entry
     is the stride between one encoder level and the next (N = downsample ×N
@@ -150,6 +173,10 @@ class DenoiseNet(nn.Module):
         ch: int | None = None,
         scaling_factors: list[int] | None = None,
         num_encoders: list[int] | None = None,
+        state_ch: int = 0,
+        feed_image: bool = True,
+        state_gated: bool = False,
+        blend_output: bool = False,
     ) -> None:
         super().__init__()
         nf = ch if ch is not None else self._BASE_CH
@@ -157,11 +184,18 @@ class DenoiseNet(nn.Module):
         num_encoders = num_encoders if num_encoders is not None else list(self._NUM_ENCODERS)
         assert len(num_encoders) == len(sf) + 1, \
             "num_encoders must have one more entry than scaling_factors (the bottleneck level)"
+        assert state_ch >= 0, "state_ch must be non-negative"
+        assert not state_gated or state_ch > 0, "state_gated needs state_ch > 0"
         self.ch = nf
         self.scaling_factors = sf
         self.num_encoders = num_encoders
+        self.state_ch = state_ch
+        self.feed_image = feed_image
+        self.state_gated = state_gated
+        self.blend_output = blend_output
+        self.in_ch = 16 + (16 if feed_image else 0) + state_ch
 
-        self.inp = nn.Conv2d(32, nf, 1)
+        self.inp = nn.Conv2d(self.in_ch, nf, 1)
 
         self.enc_blocks = nn.ModuleList([
             nn.Sequential(*[DenoiseBlock(nf) for _ in range(n)]) for n in num_encoders
@@ -176,7 +210,17 @@ class DenoiseNet(nn.Module):
 
         self.out = nn.Conv2d(nf, 16, 3, padding=1)
 
-    def residual(self, x: torch.Tensor) -> torch.Tensor:
+        if blend_output:
+            self.alpha = nn.Conv2d(nf, 1, 1)
+            nn.init.zeros_(self.alpha.bias)  # alpha starts around 0.5
+        if state_ch:
+            self.state_c = nn.Conv2d(nf, state_ch, 1)
+        if state_gated:
+            self.state_z = nn.Conv2d(nf, state_ch, 1)
+            nn.init.constant_(self.state_z.bias, 2.0)  # z ~ 0.88: start biased to remembering
+
+    def features(self, x: torch.Tensor) -> torch.Tensor:
+        """The deep path: (B, in_ch, H/4, W/4) input -> final decoder features."""
         # EXPERIMENT: discard the previous-frame half of the input, to see how
         # the network trains without it. Zeroed rather than sliced off so that
         # self.inp (and checkpoints) keep their 32-channel shape.
@@ -197,7 +241,41 @@ class DenoiseNet(nn.Module):
             up = F.interpolate(feat, size=skip.shape[-2:], mode='nearest')
             feat = dec(skip + up)
 
-        return self.out(feat)
+        return feat
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x[:, :16] + self.residual(x)
+    def forward(
+        self,
+        x: torch.Tensor,
+        prev: torch.Tensor | None = None,
+        h: torch.Tensor | None = None,
+        return_aux: bool = False,
+    ):
+        """See the class docstring. With return_aux, also returns a dict of
+        the intermediate maps ("alpha", "z") the model computed, for display."""
+        if self.state_ch and h is None:
+            h = x.new_zeros(x.shape[0], self.state_ch, *x.shape[2:])
+        parts = [x]
+        if self.feed_image:
+            parts.append(prev if prev is not None else torch.zeros_like(x))
+        if self.state_ch:
+            parts.append(h)
+        feat = self.features(torch.cat(parts, dim=1) if len(parts) > 1 else x)
+
+        aux = {}
+        out = x + self.out(feat)
+        if self.blend_output and prev is not None:
+            alpha = torch.sigmoid(self.alpha(feat))
+            out = prev + alpha * (out - prev)
+            aux["alpha"] = alpha
+
+        h_new = None
+        if self.state_ch:
+            h_new = torch.sigmoid(self.state_c(feat))
+            if self.state_gated:
+                z = torch.sigmoid(self.state_z(feat))
+                h_new = z * h + (1 - z) * h_new
+                aux["z"] = z
+
+        if return_aux:
+            return out, h_new, aux
+        return out, h_new
