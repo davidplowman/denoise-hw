@@ -141,7 +141,7 @@ class DenoiseNet(nn.Module):
 
     It returns (out, h_new):
       out:   (B, 16, H/4, W/4) -- denoised, still packed. The candidate
-             s = x + residual (residual added directly in packed space). With
+             s = clamp(x + residual, 0, 1) (residual added directly in packed space). With
              blend_output, out = prev + alpha * (s - prev), alpha being a
              learned per-pixel factor in [0, 1] shared across the 16
              channels; on the first frame out = s. The caller unpacks out
@@ -251,7 +251,8 @@ class DenoiseNet(nn.Module):
         return_aux: bool = False,
     ):
         """See the class docstring. With return_aux, also returns a dict of
-        the intermediate maps ("alpha", "z") the model computed, for display."""
+        the intermediate maps ("alpha", "z") the model computed, for display,
+        and (with blend_output) the unblended "candidate" s, for its loss."""
         if self.state_ch and h is None:
             h = x.new_zeros(x.shape[0], self.state_ch, *x.shape[2:])
         parts = [x]
@@ -262,7 +263,11 @@ class DenoiseNet(nn.Module):
         feat = self.features(torch.cat(parts, dim=1) if len(parts) > 1 else x)
 
         aux = {}
-        out = x + self.out(feat)
+        # clamp the candidate to the valid range; the blend below is then a
+        # convex combination of in-range values, so the output stays in range
+        out = torch.clamp(x + self.out(feat), 0.0, 1.0)
+        if self.blend_output:
+            aux["candidate"] = out
         if self.blend_output and prev is not None:
             alpha = torch.sigmoid(self.alpha(feat))
             out = prev + alpha * (out - prev)

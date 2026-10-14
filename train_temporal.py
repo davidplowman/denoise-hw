@@ -108,6 +108,25 @@ def _smooth(x: torch.Tensor, k: int) -> torch.Tensor:
     return F.avg_pool2d(depth_to_space(x, 2), k // 2)
 
 
+def _change_map(d: torch.Tensor, blur: int, dilate: int) -> torch.Tensor:
+    """Blur, then dilate, a (B, 16, H/4, W/4) packed frame-difference map.
+
+    Filtering is done on the unpacked same-colour planes, so colours never
+    mix, and the result is repacked to line up with the loss's tensors.
+    blur and dilate are odd kernel sizes in same-colour samples (one step is
+    2 raw pixels); 1 skips that step. The blur removes the GT's own pixel
+    noise, and the dilation then grows real changes into a band around them.
+    """
+    if blur == 1 and dilate == 1:
+        return d
+    d = depth_to_space(d, 2)
+    if blur > 1:
+        d = F.avg_pool2d(d, blur, stride=1, padding=blur // 2, count_include_pad=False)
+    if dilate > 1:
+        d = F.max_pool2d(d, dilate, stride=1, padding=dilate // 2)
+    return space_to_depth(d, 2)
+
+
 def _ema_update(ema_model: torch.nn.Module, model: torch.nn.Module, decay: float, step: int) -> None:
     """Move ema_model's weights towards model's: ema = d*ema + (1-d)*model.
 
@@ -143,6 +162,8 @@ def _loss(
 def _run_sequence(
     model: DenoiseNet, batch: dict, device: torch.device, diff_weight: float = 0.0,
     temporal_weight: float = 0.0, temporal_start: int = 1, flicker_scale: int = 4,
+    candidate_weight: float = 0.0, stats: dict | None = None,
+    diff_blur: int = 1, diff_dilate: int = 1,
 ) -> torch.Tensor:
     """Run BPTT over one batch of T-frame sequences, returning the mean per-frame loss.
 
@@ -156,7 +177,10 @@ def _run_sequence(
     With diff_weight > 0, each pixel's L1 loss (from the second frame on) is
     weighted by 1 + diff_weight * |gt_t - gt_{t-1}| (in the loss's WB/gamma
     space), to emphasise regions where the scene changed and the previous
-    output must not be trusted (e.g. detail being occluded).
+    output must not be trusted (e.g. detail being occluded). The difference
+    map is first blurred over diff_blur and then dilated over diff_dilate
+    same-colour samples (see _change_map), to drop the GT's own noise and
+    extend the weighting to a band around each change.
 
     With temporal_weight > 0, frames from temporal_start on also get a
     frame-to-frame consistency term,
@@ -167,6 +191,17 @@ def _run_sequence(
     first averaged over flicker_scale x flicker_scale raw pixels (see _smooth),
     which suppresses the GT's own pixel-level noise and targets the blobby
     shimmer that is most visible.
+
+    With candidate_weight > 0 (blend_output models only), the unblended
+    candidate s also gets candidate_weight times the per-frame loss (same
+    loss and diff weighting as the output). The blend scales s's gradient
+    by alpha, so without this s is barely trained where alpha is low and can
+    go wildly wrong there -- which in turn teaches alpha to stay low.
+
+    With stats (a dict), adds this batch's mean per-frame loss of the output
+    ("out") and, for blend_output models, of the candidate ("cand") to it --
+    both the per-frame loss with the same diff weighting but without the
+    consistency term or candidate_weight, so the two can be compared.
     """
     wl = batch["white_level"].float().to(device).view(-1, 1, 1, 1)
     noisy_seq = batch["noisy"].to(device)  # (B, T, H, W)
@@ -177,16 +212,24 @@ def _run_sequence(
     prev_output = state = None
     pred_wb_prev = gt_wb_prev = None
     total_loss = 0.0
+    out_loss = cand_loss = 0.0
     for t in range(T):
         x_t  = _pack_frame(noisy_seq[:, t], wl)
         gt_t = _pack_frame(gt_seq[:, t], wl)
-        pred, state = model(x_t, prev_output, state)
+        pred, state, aux = model(x_t, prev_output, state, return_aux=True)
         pred_wb = _to_wb(pred, cg)
         gt_wb   = _to_wb(gt_t, cg)
         weight = None
         if diff_weight > 0 and gt_wb_prev is not None:
-            weight = 1.0 + diff_weight * (gt_wb - gt_wb_prev).abs()
-        total_loss = total_loss + _loss(pred_wb, gt_wb, weight)
+            weight = 1.0 + diff_weight * _change_map((gt_wb - gt_wb_prev).abs(),
+                                                     diff_blur, diff_dilate)
+        frame_loss = _loss(pred_wb, gt_wb, weight)
+        total_loss = total_loss + frame_loss
+        out_loss = out_loss + frame_loss.detach()
+        if "candidate" in aux and (candidate_weight > 0 or stats is not None):
+            frame_cand = _loss(_to_wb(aux["candidate"], cg), gt_wb, weight)
+            total_loss = total_loss + candidate_weight * frame_cand
+            cand_loss = cand_loss + frame_cand.detach()
         if temporal_weight > 0 and t >= temporal_start:
             # pred_wb_prev is not detached: gradients reach both frames.
             tc = (_smooth(pred_wb - pred_wb_prev, flicker_scale)
@@ -195,6 +238,10 @@ def _run_sequence(
         prev_output = pred
         pred_wb_prev, gt_wb_prev = pred_wb, gt_wb
 
+    if stats is not None:
+        stats["out"] = stats.get("out", 0.0) + float(out_loss) / T
+        if "candidate" in aux:
+            stats["cand"] = stats.get("cand", 0.0) + float(cand_loss) / T
     return total_loss / T
 
 
@@ -225,6 +272,12 @@ def main() -> None:
                          help="weight each pixel's L1 loss by 1 + K * |gt_t - gt_{t-1}| "
                               "(WB/gamma space), emphasising regions where the scene "
                               "changed; 0 disables it")
+    parser.add_argument("--diff-blur",    type=int,   default=1,
+                         help="blur the --diff-weight change map over this many (odd) "
+                              "same-colour samples first, to drop the GT's noise; 1 = off")
+    parser.add_argument("--diff-dilate",  type=int,   default=1,
+                         help="then dilate it over this many (odd) same-colour samples, "
+                              "to weight a band around each change; 1 = off")
     parser.add_argument("--temporal-weight", type=float, default=0.0,
                          help="weight of the frame-to-frame consistency term "
                               "|(pred_t - pred_{t-1}) - (gt_t - gt_{t-1})| (WB/gamma "
@@ -235,6 +288,10 @@ def main() -> None:
     parser.add_argument("--flicker-scale", type=int, default=4,
                          help="average the consistency term's frame differences over "
                               "K x K raw pixels first (1 or even; 1 = no smoothing)")
+    parser.add_argument("--candidate-weight", type=float, default=0.0,
+                         help="with --blend-output, also apply this weight times the loss "
+                              "to the unblended candidate, so it stays sane where alpha "
+                              "is low; 0 disables it")
     parser.add_argument("--ema",          type=float, default=0.95,
                          help="decay of an exponential moving average of the weights; "
                               "the EMA model is the one validated and saved (0 disables it)")
@@ -274,6 +331,9 @@ def main() -> None:
         parser.error("--temporal-start must be at least 1 (frame 0 has no previous frame)")
     if args.flicker_scale != 1 and (args.flicker_scale < 2 or args.flicker_scale % 2):
         parser.error("--flicker-scale must be 1 or an even number")
+    for name in ("diff_blur", "diff_dilate"):
+        if getattr(args, name) < 1 or getattr(args, name) % 2 == 0:
+            parser.error(f"--{name.replace('_', '-')} must be an odd number >= 1")
     if args.scaling is not None:
         args.scaling = [int(v) for v in args.scaling.split()]
 
@@ -338,6 +398,10 @@ def main() -> None:
     if not args.feed_image and args.blend_output:
         print("WARNING: --no-feed-image with --blend-output: the network chooses alpha "
               "without seeing the previous output it blends with (except via the state)")
+    if args.candidate_weight > 0 and not args.blend_output:
+        print("WARNING: --candidate-weight without --blend-output: the output is the "
+              "candidate, so it has no effect")
+        args.candidate_weight = 0.0
     if not args.feed_image and not args.state_ch:
         print("WARNING: --no-feed-image with no state: the network gets nothing from "
               "previous frames (only --blend-output can use them)")
@@ -365,7 +429,9 @@ def main() -> None:
     print(f"Blend output: {args.blend_output}  Feed image: {args.feed_image}  "
           f"State channels: {args.state_ch}" + ("  (gated)" if args.state_gated else ""))
     print(f"Gain min: {args.gain_min} max: {args.gain_max}")
-    print(f"GT-difference loss weight: {args.diff_weight}")
+    print(f"GT-difference loss weight: {args.diff_weight}  "
+          f"(blur {args.diff_blur}, dilate {args.diff_dilate})")
+    print(f"Candidate loss weight: {args.candidate_weight}")
     print(f"Temporal consistency weight: {args.temporal_weight}  (from frame {args.temporal_start}, scale {args.flicker_scale})")
     print(f"Weight EMA decay: {args.ema or 'off'}  Validation: "
           + ("random draws" if args.val_seed < 0 else f"fixed, gain-stratified (seed {args.val_seed})"))
@@ -397,7 +463,9 @@ def main() -> None:
         for batch in tqdm(train_loader, desc=f"Epoch {epoch}", leave=False, disable=args.no_pbar):
             optimizer.zero_grad()
             loss = _run_sequence(model, batch, device, args.diff_weight,
-                                 args.temporal_weight, args.temporal_start, args.flicker_scale)
+                                 args.temporal_weight, args.temporal_start, args.flicker_scale,
+                                 args.candidate_weight,
+                                 diff_blur=args.diff_blur, diff_dilate=args.diff_dilate)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -406,7 +474,6 @@ def main() -> None:
             step += 1
             train_loss += loss.item()
         train_loss /= len(train_loader)
-        t_train = time.time() - t0
 
         if math.isnan(train_loss):
             consecutive_nans += 1
@@ -431,15 +498,21 @@ def main() -> None:
         consecutive_nans = 0
 
         # validate (and save) the EMA weights when enabled
+        # (without the candidate loss, so val losses compare across runs)
         eval_model = ema_model if ema_model is not None else model
         eval_model.eval()
         val_loss = 0.0
+        val_stats = {}
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="Val", leave=False, disable=args.no_pbar):
                 val_loss += _run_sequence(eval_model, batch, device, args.diff_weight,
-                                            args.temporal_weight, args.temporal_start, args.flicker_scale).item()
+                                            args.temporal_weight, args.temporal_start, args.flicker_scale,
+                                            stats=val_stats, diff_blur=args.diff_blur,
+                                            diff_dilate=args.diff_dilate).item()
         val_loss /= len(val_loader)
-        t_val = time.time() - t0 - t_train
+        # per-frame losses of the output and (blend models) the candidate
+        val_parts = "".join(f"  {k} {v / len(val_loader):.3f}" for k, v in val_stats.items()) \
+            if "cand" in val_stats else ""
 
         elapsed = round(time.time() - t0)
         lr = optimizer.param_groups[0]["lr"]
@@ -449,14 +522,16 @@ def main() -> None:
             torch.save(
                 {"state_dict": eval_model.state_dict(), "ch": model.ch, "scaling_factors": model.scaling_factors, "num_encoders": model.num_encoders,
                  "diff_weight": args.diff_weight,
+                 "diff_blur": args.diff_blur, "diff_dilate": args.diff_dilate,
                  "temporal_weight": args.temporal_weight, "temporal_start": args.temporal_start,
                  "flicker_scale": args.flicker_scale,
+                 "candidate_weight": args.candidate_weight,
                  "blend_output": model.blend_output, "state_ch": model.state_ch,
                  "state_gated": model.state_gated, "feed_image": model.feed_image},
                 "checkpoints/best_temporal.pth",
             )
         tag = f"  -> improved: {val_loss:.5f}" if improved else ""
-        print(f"Epoch {epoch}  train {train_loss:.5f}  val {val_loss:.5f}  lr {lr:.2e}  {elapsed}s (train {t_train:.1f}s, val {t_val:.1f}s){tag}")
+        print(f"Epoch {epoch}  train {train_loss:.5f}  val {val_loss:.5f}{val_parts}  lr {lr:.2e}  {elapsed}s{tag}")
 
         scheduler.step(val_loss)
         if optimizer.param_groups[0]["lr"] <= args.lr_min:

@@ -14,8 +14,10 @@
 #   ch=64 scaling="2" encoders="1 1"    network size
 #   gmin=32 gmax=128                    synthetic noise gain range
 #   diff=0           --diff-weight
+#   dblur=1 ddil=1   --diff-blur / --diff-dilate (odd, same-colour samples)
 #   temporal=0       --temporal-weight
 #   blend=1          --blend-output
+#   cand=0           --candidate-weight (with blend=1)
 #   state=S          --state-ch S
 #   gated=1          --state-gated
 #   feed=0           --no-feed-image
@@ -36,7 +38,7 @@ TEST_CLIPS=(cabinet_D50_36_static_0 cabinet_D50_96_static_0 cabinet_D65_100_loca
 
 declare -A DEFAULTS=(
     [ch]=64 [scaling]="2" [encoders]="1 1" [gmin]=32 [gmax]=128
-    [diff]=0 [temporal]=0 [blend]=0 [state]=0 [gated]=0 [feed]=1
+    [diff]=0 [dblur]=1 [ddil]=1 [temporal]=0 [blend]=0 [cand]=0 [state]=0 [gated]=0 [feed]=1
     [resume]="" [name]="" [extra]=""
 )
 
@@ -53,13 +55,21 @@ run_training() {
         o[${kv%%=*}]="${kv#*=}"
     done
 
-    local tag="${o[ch]}_${o[scaling]// /}e${o[encoders]// /}_g${o[gmin]}-${o[gmax]}_d${o[diff]}_t${o[temporal]}"
+    local tag="${o[ch]}_${o[scaling]// /}e${o[encoders]// /}_g${o[gmin]}-${o[gmax]}_d${o[diff]}"
+    if [[ "${o[dblur]}" != 1 || "${o[ddil]}" != 1 ]]; then
+        tag+="_b${o[dblur]}x${o[ddil]}"
+    fi
+    tag+="_t${o[temporal]}"
     local args=(--ch "${o[ch]}" --scaling "${o[scaling]}" --encoders ${o[encoders]}
                 --gain-min "${o[gmin]}" --gain-max "${o[gmax]}"
-                --diff-weight "${o[diff]}" --temporal-weight "${o[temporal]}")
+                --diff-weight "${o[diff]}" --diff-blur "${o[dblur]}" --diff-dilate "${o[ddil]}"
+                --temporal-weight "${o[temporal]}")
     local test_args=()
     if [[ "${o[blend]}" == 1 ]]; then
         tag+="_blend"; args+=(--blend-output); test_args+=(--save-alpha)
+    fi
+    if [[ "${o[cand]}" != 0 ]]; then
+        tag+="_c${o[cand]}"; args+=(--candidate-weight "${o[cand]}")
     fi
     if [[ "${o[state]}" != 0 ]]; then
         tag+="_s${o[state]}"; args+=(--state-ch "${o[state]}"); test_args+=(--save-state)
@@ -129,4 +139,6 @@ run_training() {
 #run_training diff=50 temporal=10 state=4 gated=1                    # B-gated
 #run_training diff=50 temporal=10 state=8 gated=1 feed=0             # C-gated
 #run_training runs=2 diff=50 temporal=10 blend=1 state=4 gated=1            # E
-run_training ch=32 runs=3 diff=50 temporal=10 blend=1
+run_training ch=32 runs=3 diff=50 temporal=10 blend=1 cand=0.1
+run_training ch=64 runs=3 diff=50 temporal=10 blend=1 cand=0.1
+run_training ch=96 runs=3 diff=50 temporal=10 blend=1 cand=0.1
