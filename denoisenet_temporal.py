@@ -103,22 +103,33 @@ class DenoiseBlock(nn.Module):
     """Encoder/decoder block with simple channel attention mechanism.
     """
 
-    def __init__(self, c: int) -> None:
+    def __init__(self, c: int, gate_clamp: float | None = None) -> None:
         super().__init__()
 
+        # gate_clamp limits the gate's pre-sigmoid values to +-gate_clamp
+        # (where the sigmoid is saturated anyway), so int8 can give them a
+        # fixed, tight range. The quantised exports leave the clamp out of
+        # the graph (clamp_in_graph False): their int8 range is fixed to
+        # +-gate_clamp, so int8 saturation does the same clamp.
+        #self.gate_clamp = gate_clamp
+        #self.clamp_in_graph = True
         self.conv1 = nn.Conv2d(c, c, 1)
-        self.dw    = nn.Conv2d(c, c, 3, padding=1, groups=c)
+        self.dw    = nn.Conv2d(c, c, 5, padding=2, groups=c)
         self.conv2 = nn.Conv2d(c, c, 1)
-        self.gate = nn.Sequential(
-            nn.Conv2d(c, c, 3, padding=1, groups=c),
-            nn.Conv2d(c, c, 1),
-            nn.Sigmoid(),
-        )
+        #self.gate = nn.Sequential(
+        #    nn.Conv2d(c, c, 3, padding=1, groups=c),
+        #    nn.Conv2d(c, c, 1),
+        #    nn.Sigmoid(),
+        #)
 
     def forward(self, inp: torch.Tensor) -> torch.Tensor:
         x = F.relu(self.dw(self.conv1(inp)))
-        x = self.conv2(x + inp)
-        return self.gate(x) * x
+        x = self.conv2(x) + inp
+        return x
+        #g = self.gate[1](self.gate[0](x))
+        #if self.gate_clamp and self.clamp_in_graph:
+        #    g = torch.clamp(g, -self.gate_clamp, self.gate_clamp)
+        #return self.gate[2](g) * x
 
 
 class DenoiseNet(nn.Module):
@@ -177,6 +188,7 @@ class DenoiseNet(nn.Module):
         feed_image: bool = True,
         state_gated: bool = False,
         blend_output: bool = False,
+        gate_clamp: float | None = None,
     ) -> None:
         super().__init__()
         nf = ch if ch is not None else self._BASE_CH
@@ -193,12 +205,13 @@ class DenoiseNet(nn.Module):
         self.feed_image = feed_image
         self.state_gated = state_gated
         self.blend_output = blend_output
+        self.gate_clamp = gate_clamp
         self.in_ch = 16 + (16 if feed_image else 0) + state_ch
 
         self.inp = nn.Conv2d(self.in_ch, nf, 1)
 
         self.enc_blocks = nn.ModuleList([
-            nn.Sequential(*[DenoiseBlock(nf) for _ in range(n)]) for n in num_encoders
+            nn.Sequential(*[DenoiseBlock(nf, gate_clamp) for _ in range(n)]) for n in num_encoders
         ])
         self.downs = nn.ModuleList([
             nn.Conv2d(nf, nf, s, stride=s) if s > 1 else nn.Identity()
@@ -206,7 +219,7 @@ class DenoiseNet(nn.Module):
         ])
 
         n_dec = len(sf)
-        self.dec_blocks = nn.ModuleList([DenoiseBlock(nf) for _ in range(n_dec)])
+        self.dec_blocks = nn.ModuleList([DenoiseBlock(nf, gate_clamp) for _ in range(n_dec)])
 
         self.out = nn.Conv2d(nf, 16, 3, padding=1)
 
@@ -225,8 +238,10 @@ class DenoiseNet(nn.Module):
         # the network trains without it. Zeroed rather than sliced off so that
         # self.inp (and checkpoints) keep their 32-channel shape.
         #x = torch.cat([x[:, :16], torch.zeros_like(x[:, 16:])], dim=1)
-        feat = self.inp(x)
+        return self._deep(self.inp(x))
 
+    def _deep(self, feat: torch.Tensor) -> torch.Tensor:
+        """features() from self.inp's output on."""
         skips = []
         for i, enc in enumerate(self.enc_blocks):
             feat  = enc(feat)
@@ -284,3 +299,46 @@ class DenoiseNet(nn.Module):
         if return_aux:
             return out, h_new, aux
         return out, h_new
+
+    def core(self, x: torch.Tensor, prev: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """The exportable part of a feed_image + blend_output model (no
+        hidden state): returns (residual, alpha_logit), (B, 16, H/4, W/4) and
+        (B, 1, H/4, W/4). The caller completes forward() itself, in float:
+        s = clamp(x + residual, 0, 1), then on every frame but the first
+        (where prev is zeros and out = s), out = prev + sigmoid(alpha_logit)
+        * (s - prev)."""
+        assert self.feed_image and self.blend_output and not self.state_ch, \
+            "core() needs a feed_image + blend_output model with no hidden state"
+        feat = self.features(torch.cat([x, prev], dim=1))
+        return self.out(feat), self.alpha(feat)
+
+
+class TemporalCoreNet(nn.Module):
+    """Wraps a DenoiseNet to export just its core (see DenoiseNet.core):
+    (x, prev) -> (residual, alpha_logit), with the skip add, clamp and blend
+    left to the caller, in float.
+
+    Its inputs and outputs are channels-last (NHWC), as the exports' are:
+    x and prev are concatenated on the channel axis before a single
+    permute to NCHW, which LiteRT folds into its own layout conversion -- a
+    channel concat of NCHW tensors instead gets wrapped in mid-graph
+    transposes. It's one concat and one self.inp conv, so in int8 a single
+    quantisation point, with x's and prev's weights sharing their scales.
+    """
+
+    def __init__(self, net: DenoiseNet) -> None:
+        super().__init__()
+        self.net = net
+
+    def forward(self, x: torch.Tensor, prev: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        net = self.net
+        feat = net._deep(net.inp(torch.cat([x, prev], dim=3).permute(0, 3, 1, 2)))
+        return net.out(feat).permute(0, 2, 3, 1), net.alpha(feat).permute(0, 2, 3, 1)
+
+
+def set_clamp_in_graph(net: DenoiseNet, on: bool) -> None:
+    """Include (on) or leave out the gate clamp ops when tracing net (see
+    DenoiseBlock)."""
+    for m in net.modules():
+        if isinstance(m, DenoiseBlock):
+            m.clamp_in_graph = on

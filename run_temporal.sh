@@ -23,6 +23,8 @@
 #   feed=0           --no-feed-image
 #   resume=PTH       fine-tune from this checkpoint (copied first, so every
 #                    run starts from the same weights)
+#   qat=1            --qat: quantisation-aware fine-tuning (needs resume=)
+#   gclamp=G         --gate-clamp G: clamp the gates' pre-sigmoid values to +-G
 #   name=STR         extra suffix for the tag, to tell configurations apart
 #   extra="..."      any other train_temporal.py arguments, passed as is
 
@@ -39,7 +41,7 @@ TEST_CLIPS=(cabinet_D50_36_static_0 cabinet_D50_96_static_0 cabinet_D65_100_loca
 declare -A DEFAULTS=(
     [ch]=64 [scaling]="2" [encoders]="1 1" [gmin]=32 [gmax]=128
     [diff]=0 [dblur]=1 [ddil]=1 [temporal]=0 [blend]=0 [cand]=0 [state]=0 [gated]=0 [feed]=1
-    [resume]="" [name]="" [extra]=""
+    [resume]="" [qat]=0 [gclamp]=0 [name]="" [extra]=""
 )
 
 run_training() {
@@ -86,6 +88,12 @@ run_training() {
         resume_copy=$(mktemp --suffix=.pth)
         cp "${o[resume]}" "$resume_copy" || return 1
         args+=(--resume "$resume_copy")
+    fi
+    if [[ "${o[gclamp]}" != 0 ]]; then
+        tag+="_gc${o[gclamp]}"; args+=(--gate-clamp "${o[gclamp]}")
+    fi
+    if [[ "${o[qat]}" == 1 ]]; then
+        tag+="_qat"; args+=(--qat)
     fi
     [[ -n "${o[name]}" ]] && tag+="_${o[name]}"
     if [[ -e "run_${tag}.txt" ]]; then
@@ -139,6 +147,11 @@ run_training() {
 #run_training diff=50 temporal=10 state=4 gated=1                    # B-gated
 #run_training diff=50 temporal=10 state=8 gated=1 feed=0             # C-gated
 #run_training runs=2 diff=50 temporal=10 blend=1 state=4 gated=1            # E
-run_training ch=32 runs=3 diff=50 temporal=10 blend=1 cand=0.1
-run_training ch=64 runs=3 diff=50 temporal=10 blend=1 cand=0.1
-run_training ch=96 runs=3 diff=50 temporal=10 blend=1 cand=0.1
+
+#run_training ch=32 runs=3 diff=50 temporal=10 blend=1 cand=0.1
+#run_training ch=64 runs=3 diff=50 temporal=10 blend=1 cand=0.1
+#run_training ch=96 runs=3 diff=50 temporal=10 blend=1 cand=0.1
+
+run_training ch=64 diff=50 temporal=10 blend=1 cand=0.1 gclamp=8 qat=1 runs=1 \
+    resume=checkpoints/imx662_64_2e11_g32-128_d50_t10_b_c01.pth \
+    extra="--lr 2e-4 --epochs 300"

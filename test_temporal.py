@@ -7,7 +7,13 @@ PNGs per frame and prints PSNR/SSIM against ground truth.
 
 With --still-checkpoint, also runs the single-image (non-temporal) DenoiseNet
 on exactly the same noisy frames, writing <N>_still.png and reporting its
-PSNR/SSIM alongside, for comparison.
+PSNR/SSIM alongside, for comparison. With --still-int8 it is also run in
+simulated int8 (convert.py's int8 export: post-training quantisation of its
+residual branch, the skip add in float), as the "still_int8" output, writing
+<N>_still_int8.png -- the fair comparison for a QAT checkpoint. Its ranges
+are calibrated on a few of the clip's own frames, with noise synthesised at
+the test gain from an independent RNG stream (so not the test frames' noise),
+or with --still-calib-dataset on real captures, as convert.py does.
 
 With --change-threshold, also reports PSNR over only the pixels where the GT
 changed from the previous frame by more than the threshold (measured in the
@@ -31,6 +37,7 @@ For models with a blended output or hidden state, --save-alpha and
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import cv2
@@ -79,7 +86,8 @@ def _load_model(checkpoint: str, model_cls: type = DenoiseNet) -> torch.nn.Modul
     if isinstance(ckpt, dict) and "state_dict" in ckpt:
         extra = {}
         if model_cls is DenoiseNet:
-            extra = {k: ckpt[k] for k in ("state_ch", "feed_image", "state_gated", "blend_output")
+            extra = {k: ckpt[k] for k in ("state_ch", "feed_image", "state_gated", "blend_output",
+                                          "gate_clamp")
                      if k in ckpt}
         model = model_cls(ch=ckpt.get("ch"), scaling_factors=ckpt.get("scaling_factors"),
                            num_encoders=ckpt.get("num_encoders"), **extra)
@@ -91,6 +99,33 @@ def _load_model(checkpoint: str, model_cls: type = DenoiseNet) -> torch.nn.Modul
     return model
 
 
+def _quantize_still(still_model: torch.nn.Module, x: torch.Tensor, dng_paths: list[Path],
+                    args: argparse.Namespace, defects: np.ndarray) -> torch.nn.Module:
+    """still_model's residual branch in simulated int8, exactly as convert.py's
+    int8 export quantises it, for inputs of x's shape (see the module
+    docstring for the calibration data)."""
+    import convert  # imported lazily: it pulls in the conversion tools
+
+    calib = None
+    if args.still_calib_dataset is None:
+        # independent of the test noise's RNG, so the test frames are untouched
+        rng = np.random.default_rng(None if args.seed is None else [args.seed, 1])
+        n = min(args.still_calib_count, len(dng_paths))
+        picks = [dng_paths[i * len(dng_paths) // n] for i in range(n)]
+        calib = []
+        for dp in picks:
+            dng = DNG(str(dp), sensor_name=_SENSOR_NAME)
+            pixel = (dng.bayer.astype(np.float32) - dng.black_level
+                     + synthetic_noise.black_level(args.gain))
+            noisy = synthetic_noise.add_noise(pixel, args.gain, rng, defects).astype(np.uint16)
+            calib.append(_pack(noisy, dng.white_level))
+        print(f"Still model int8: calibrating on {n} of the clip's frames "
+              f"(fresh noise at gain {args.gain:g})")
+    quantized, _ = convert._quantize_int8(
+        still_model, x, args.still_calib_dataset, args.still_calib_count, calib_examples=calib)
+    return quantized
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate the temporal DenoiseNet on one clip.")
     parser.add_argument("clip", help="Name of the clip folder (e.g. office_0)")
@@ -98,6 +133,15 @@ def main() -> None:
     parser.add_argument("--still-checkpoint", default=None, metavar="PTH",
                          help="also denoise each frame with this single-image "
                               "(non-temporal) DenoiseNet checkpoint, for comparison")
+    parser.add_argument("--still-int8", action="store_true",
+                         help="also run the still model in simulated int8, as convert.py's "
+                              "int8 export would (needs --still-checkpoint)")
+    parser.add_argument("--still-calib-dataset", default=None, metavar="ROOT",
+                         help="with --still-int8, calibrate on real captures under ROOT (as "
+                              "convert.py --calib-dataset) instead of the clip's own frames")
+    parser.add_argument("--still-calib-count", type=int, default=4, metavar="N",
+                         help="with --still-int8, number of images to calibrate on "
+                              "(default: %(default)s)")
     parser.add_argument("--output", default="output_temporal", metavar="DIR")
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--gain", type=float, required=True)
@@ -114,12 +158,17 @@ def main() -> None:
                          help="with --change-threshold, write <N>_mask.png for each frame")
     parser.add_argument("--save-alpha", action="store_true",
                          help="with a blended-output model, write <N>_alpha.png for each frame")
+    parser.add_argument("--summary-json", type=Path, default=None, metavar="PATH",
+                         help="also write the end-of-run means (per output: PSNR, SSIM, "
+                              "changed-region PSNR, flicker) to this JSON file")
     parser.add_argument("--save-state", action="store_true",
                          help="with a hidden-state model, write <N>_state<C>.png for each "
                               "frame and state channel (and print the gate's mean if gated)")
     args = parser.parse_args()
     if args.flicker_scale != 1 and (args.flicker_scale < 2 or args.flicker_scale % 2):
         parser.error("--flicker-scale must be 1 or an even number")
+    if args.still_int8 and not args.still_checkpoint:
+        parser.error("--still-int8 needs --still-checkpoint")
     k = args.flicker_scale
 
     clip_dir = Path(args.dataset) / args.clip
@@ -137,6 +186,12 @@ def main() -> None:
     print(f"Model: ch={model.ch}  scaling={model.scaling_factors}  encoders={model.num_encoders}  "
           f"blend={model.blend_output}  feed_image={model.feed_image}  "
           f"state_ch={model.state_ch}{' (gated)' if model.state_gated else ''}")
+    ckpt = torch.load(args.checkpoint, map_location="cpu")
+    if isinstance(ckpt, dict) and ckpt.get("qat"):
+        import qat_temporal  # imported lazily: it pulls in the conversion tools
+
+        model = qat_temporal.load_qat_net(model, ckpt)
+        print("QAT checkpoint: running with simulated int8, as exported")
 
     still_model = None
     if args.still_checkpoint:
@@ -146,6 +201,7 @@ def main() -> None:
 
     rng = np.random.default_rng(args.seed)
     defects = None  # one map, shared across the whole processed sequence
+    still_int8 = None  # built on the first frame, once its size is known
 
     # scores[(output, reference)] = list of per-frame (PSNR, SSIM)
     scores: dict[tuple[str, str], list[tuple[float, float]]] = {}
@@ -194,7 +250,8 @@ def main() -> None:
         gt_dng = DNG(str(dp), sensor_name=_SENSOR_NAME)
 
         if defects is None:
-            defects = synthetic_noise.make_defect_map(shape=gt_dng.bayer.shape)
+            # seeded too, so runs with the same --seed see identical noise
+            defects = synthetic_noise.make_defect_map(shape=gt_dng.bayer.shape, seed=args.seed)
 
         signal = gt_dng.bayer.astype(np.float32) - gt_dng.black_level
         target_black = synthetic_noise.black_level(args.gain)
@@ -202,6 +259,8 @@ def main() -> None:
         noisy_bayer = synthetic_noise.add_noise(pixel, args.gain, rng, defects).astype(np.uint16)
 
         x = _pack(noisy_bayer, gt_dng.white_level)
+        if args.still_int8 and still_int8 is None:
+            still_int8 = _quantize_still(still_model, x, dng_paths, args, defects)
         with torch.no_grad():
             pred, state, aux = model(x, prev_output, state, return_aux=True)
         prev_output = pred
@@ -268,6 +327,13 @@ def main() -> None:
             still_rgb = gt_dng.to_rgb(bayer=still_bayer, output_bps=16)
             _save_png(still_rgb, out / f"{num}_still.png")
             outputs.append(("still", still_rgb, still_pred))
+        if still_int8 is not None:
+            with torch.no_grad():
+                still_pred = x + still_int8(x)  # skip add in float, as on the device
+            still_bayer = _unpack(still_pred, gt_dng.white_level, gt_dng.bayer.shape)
+            still_rgb = gt_dng.to_rgb(bayer=still_bayer, output_bps=16)
+            _save_png(still_rgb, out / f"{num}_still_int8.png")
+            outputs.append(("still_int8", still_rgb, still_pred))
 
         for name, rgb, packed in outputs:
             pred_wb = _to_wb(packed, channel_gains)
@@ -279,10 +345,13 @@ def main() -> None:
             prev_pred_wb[name] = pred_wb
             score(name, "gt", gt_rgb, rgb, mask, flick)
 
+    # summary[output] = the means below, for --summary-json
+    summary: dict[str, dict] = {}
     print(f"\nMean over {len(dng_paths)} frames:")
     for (name, ref_name), vals in scores.items():
         p, s = np.mean(vals, axis=0)
         print(f"  PSNR {p:8.3f}  SSIM {s:8.4f}  ({name} vs {ref_name})")
+        summary.setdefault(name, {}).update(psnr=float(p), ssim=float(s))
 
     if args.change_threshold is not None and changed_pixels[1]:
         print(f"\nChanged regions (threshold {args.change_threshold}, "
@@ -291,6 +360,8 @@ def main() -> None:
         for (name, ref_name), (sq_err, count) in changed.items():
             p = f"{10 * np.log10(65535 ** 2 * count / sq_err):8.3f}" if count else "       —"
             print(f"  PSNR {p}  ({name} vs {ref_name})")
+            if count:
+                summary.setdefault(name, {})["changed_psnr"] = float(p)
 
     if gt_deltas:
         print(f"\nFrame-to-frame differences (WB/gamma space, averaged over {k}x{k} raw pixels, "
@@ -299,6 +370,13 @@ def main() -> None:
         for name, vals in flicker.items():
             f, d = np.mean(vals, axis=0)
             print(f"  |pred_t - pred_t-1| {d:.5f}  flicker@{k} {f:.5f}  ({name})")
+            summary.setdefault(name, {})["flicker"] = float(f)
+
+    if args.summary_json is not None:
+        args.summary_json.parent.mkdir(parents=True, exist_ok=True)
+        args.summary_json.write_text(json.dumps(
+            {"clip": args.clip, "checkpoint": args.checkpoint, "gain": args.gain,
+             "frames": len(dng_paths), "outputs": summary}, indent=2))
 
 if __name__ == "__main__":
     main()

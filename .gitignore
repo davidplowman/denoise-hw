@@ -8,3 +8,12 @@ venv
 ncnn-src
 .vscode
 cache_*
+experiments
+run_*
+IMX662_temporal
+output_temporal
+ncnn
+lite
+onnx
+openvino
+output_imx219

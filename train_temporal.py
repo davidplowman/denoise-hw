@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from dataset_temporal import load_datasets, worker_init_fn
+import qat_temporal
 from denoisenet_temporal import DenoiseNet, depth_to_space, space_to_depth
 
 
@@ -138,7 +139,9 @@ def _ema_update(ema_model: torch.nn.Module, model: torch.nn.Module, decay: float
         for e, p in zip(ema_model.parameters(), model.parameters()):
             e.lerp_(p, 1.0 - d)
         for e, b in zip(ema_model.buffers(), model.buffers()):
-            e.copy_(b)
+            # (resized first: some fake-quantise buffers only get their
+            # per-channel shape on the first forward pass)
+            e.resize_as_(b).copy_(b)
 
 
 def _loss(
@@ -299,6 +302,16 @@ def main() -> None:
                          help="seed of the fixed, gain-stratified validation set "
                               "(-1: random validation draws every epoch instead)")
     parser.add_argument("--resume",       default=None, metavar="WEIGHTS")
+    parser.add_argument("--checkpoint-out", type=Path, default=Path("checkpoints/best_temporal.pth"),
+                         metavar="PTH", help="where to save the best checkpoint "
+                                             "(default: %(default)s)")
+    parser.add_argument("--qat",          action="store_true",
+                         help="quantisation-aware fine-tuning of the --resume checkpoint: "
+                              "the network runs with simulated int8, as convert_temporal.py "
+                              "exports it (feed_image + blend_output models without state)")
+    parser.add_argument("--qat-freeze-epoch", type=int, default=20,
+                         help="with --qat, stop updating the int8 ranges after this many "
+                              "epochs, training only the weights from then on")
     parser.add_argument("--lr",           type=float, default=2e-3)
     parser.add_argument("--lr-min",       type=float, default=1e-5)
     parser.add_argument("--lr-patience",  type=int,   default=10)
@@ -320,6 +333,10 @@ def main() -> None:
                               "(0 = none)")
     parser.add_argument("--state-gated",  action="store_true", default=None,
                          help="gated hidden state update, h = z*h + (1-z)*c")
+    parser.add_argument("--gate-clamp",   type=float, default=None, metavar="G",
+                         help="clamp each block's gate pre-sigmoid values to +-G (e.g. 8), "
+                              "so int8 can give them a tight, fixed range; barely changes the "
+                              "float model")
     parser.add_argument("--no-feed-image", dest="feed_image", action="store_false", default=None,
                          help="don't feed the previous output back in as input")
     args = parser.parse_args()
@@ -388,11 +405,13 @@ def main() -> None:
         else:
             state_dict = ckpt
     for key, default in (("blend_output", False), ("state_ch", 0),
-                         ("state_gated", False), ("feed_image", True)):
+                         ("state_gated", False), ("feed_image", True), ("gate_clamp", None)):
         if getattr(args, key) is None:
             setattr(args, key, ckpt_cfg.get(key, default))
     if args.state_ch < 0:
         parser.error("--state-ch must be non-negative")
+    if args.qat and not args.resume:
+        parser.error("--qat fine-tunes a trained model: give --resume")
     if args.state_gated and not args.state_ch:
         parser.error("--state-gated needs --state-ch > 0")
     if not args.feed_image and args.blend_output:
@@ -409,7 +428,8 @@ def main() -> None:
     def make_model() -> DenoiseNet:
         return DenoiseNet(ch=args.ch, scaling_factors=args.scaling, num_encoders=args.encoders,
                           state_ch=args.state_ch, feed_image=args.feed_image,
-                          state_gated=args.state_gated, blend_output=args.blend_output).to(device)
+                          state_gated=args.state_gated, blend_output=args.blend_output,
+                          gate_clamp=args.gate_clamp).to(device)
 
     model = make_model()
     if state_dict is not None:
@@ -431,10 +451,27 @@ def main() -> None:
     print(f"Gain min: {args.gain_min} max: {args.gain_max}")
     print(f"GT-difference loss weight: {args.diff_weight}  "
           f"(blur {args.diff_blur}, dilate {args.diff_dilate})")
-    print(f"Candidate loss weight: {args.candidate_weight}")
+    print(f"Candidate loss weight: {args.candidate_weight}  "
+          f"Gate clamp: {args.gate_clamp or 'off'}")
     print(f"Temporal consistency weight: {args.temporal_weight}  (from frame {args.temporal_start}, scale {args.flicker_scale})")
     print(f"Weight EMA decay: {args.ema or 'off'}  Validation: "
           + ("random draws" if args.val_seed < 0 else f"fixed, gain-stratified (seed {args.val_seed})"))
+
+    def make_qat(m: DenoiseNet, ckpt: dict | None = None) -> qat_temporal.QATTemporalNet:
+        """Wrap a float model (holding the weights to start from) for QAT,
+        restoring ckpt's QAT state if it's a QAT checkpoint."""
+        if ckpt is not None and ckpt.get("qat"):
+            return qat_temporal.load_qat_net(m, ckpt, frozen=False)
+        return qat_temporal.QATTemporalNet(qat_temporal.make_qat_core(m), m)
+
+    if args.qat:
+        try:
+            qat_temporal.check_model(model)
+        except ValueError as e:
+            parser.error(str(e))
+        model = make_qat(model, ckpt_cfg)
+        print(f"QAT: simulated int8, ranges frozen after epoch {args.qat_freeze_epoch}"
+              + ("  (resuming QAT state)" if ckpt_cfg.get("qat") else ""))
 
     def make_ema(m: DenoiseNet) -> DenoiseNet | None:
         if not args.ema:
@@ -451,13 +488,25 @@ def main() -> None:
         optimizer, mode="min", factor=0.5,
         patience=args.lr_patience,
     )
-    Path("checkpoints").mkdir(exist_ok=True)
+    args.checkpoint_out.parent.mkdir(parents=True, exist_ok=True)
     best_val = float("inf")
+    saved = False  # a checkpoint has been written (best_val may since have been reset)
     consecutive_nans = 0
 
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
 
+        if args.qat and epoch == args.qat_freeze_epoch + 1:
+            qat_temporal.freeze_ranges(model)
+            # val losses with frozen ranges don't compare with those before
+            # (they jump when the ranges freeze), so restart the best-model
+            # tracking and the LR schedule: the saved checkpoint is then the
+            # best with frozen ranges, as exported
+            best_val = float("inf")
+            for g in optimizer.param_groups:
+                g["lr"] = args.lr
+            scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=args.lr_patience)
+            print(f"Epoch {epoch}  QAT: int8 ranges frozen (best val and LR schedule reset)")
         model.train()
         train_loss = 0.0
         for batch in tqdm(train_loader, desc=f"Epoch {epoch}", leave=False, disable=args.no_pbar):
@@ -481,14 +530,22 @@ def main() -> None:
                 print(f"Epoch {epoch}  NaN loss — {consecutive_nans} in a row, quitting.")
                 break
             model = make_model()
-            if best_val < float("inf"):
-                ckpt = torch.load("checkpoints/best_temporal.pth", map_location=device)
+            if saved:
+                ckpt = torch.load(args.checkpoint_out, map_location=device)
                 model.load_state_dict(ckpt["state_dict"])
+                if args.qat:
+                    model = make_qat(model, ckpt)
                 print(f"Epoch {epoch}  NaN loss ({consecutive_nans}/10) — "
-                      f"reloaded checkpoints/best_temporal.pth (val {best_val:.5f}) and recreated optimizer.")
+                      f"reloaded {args.checkpoint_out} (val {best_val:.5f}) and recreated optimizer.")
             else:
+                if args.qat:
+                    # QAT always resumes: restart from that checkpoint
+                    model.load_state_dict(state_dict, strict=False)
+                    model = make_qat(model, ckpt_cfg)
                 print(f"Epoch {epoch}  NaN loss ({consecutive_nans}/10) — "
                       f"no checkpoint yet, recreating model from scratch.")
+            if args.qat and epoch > args.qat_freeze_epoch:
+                qat_temporal.freeze_ranges(model)
             optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
             scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=args.lr_patience)
             ema_model = make_ema(model)
@@ -519,6 +576,7 @@ def main() -> None:
         improved = val_loss < best_val
         if improved:
             best_val = val_loss
+            saved = True
             torch.save(
                 {"state_dict": eval_model.state_dict(), "ch": model.ch, "scaling_factors": model.scaling_factors, "num_encoders": model.num_encoders,
                  "diff_weight": args.diff_weight,
@@ -527,8 +585,11 @@ def main() -> None:
                  "flicker_scale": args.flicker_scale,
                  "candidate_weight": args.candidate_weight,
                  "blend_output": model.blend_output, "state_ch": model.state_ch,
-                 "state_gated": model.state_gated, "feed_image": model.feed_image},
-                "checkpoints/best_temporal.pth",
+                 "state_gated": model.state_gated, "feed_image": model.feed_image,
+                 "gate_clamp": model.gate_clamp,
+                 # a QAT model's float weights, plus its QAT state
+                 **(eval_model.checkpoint_entries() if args.qat else {})},
+                args.checkpoint_out,
             )
         tag = f"  -> improved: {val_loss:.5f}" if improved else ""
         print(f"Epoch {epoch}  train {train_loss:.5f}  val {val_loss:.5f}{val_parts}  lr {lr:.2e}  {elapsed}s{tag}")

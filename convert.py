@@ -397,17 +397,19 @@ def _make_fixed_input_quantizer(global_config) -> "torch.nn.Module":
     class _FixedInputQuantizer(pt2e_quantizer.PT2EQuantizer):
         def annotate(self, model):
             model = super().annotate(model)
-            placeholder = next(n for n in model.graph.nodes if n.op == "placeholder")
-            for user in list(placeholder.users):
-                ann = user.meta.get("quantization_annotation")
-                if ann and placeholder in ann.input_qspec_map:
-                    ann.input_qspec_map[placeholder] = fixed_input_spec
+            # every graph input (just one for DenoiseNet; x and prev for
+            # convert_temporal.py's core) is a [0, 1] image
+            for placeholder in (n for n in model.graph.nodes if n.op == "placeholder"):
+                for user in list(placeholder.users):
+                    ann = user.meta.get("quantization_annotation")
+                    if ann and placeholder in ann.input_qspec_map:
+                        ann.input_qspec_map[placeholder] = fixed_input_spec
             return model
 
     return _FixedInputQuantizer().set_global(global_config)
 
 
-def _override_output_scale(prepared, output_scale: float) -> None:
+def _override_output_scale(prepared, output_scale: float, output_index: int | None = None) -> None:
     """Force the calibrated output observer to report output_scale from
     calculate_qparams(), leaving its calibrated zero_point untouched.
 
@@ -417,9 +419,18 @@ def _override_output_scale(prepared, output_scale: float) -> None:
     reads calculate_qparams() to bake the scale/zero_point into the graph as
     constants -- there's no public option for this, so the observer instance
     feeding the graph's output is patched directly.
+
+    output_index picks which output, for a graph with several (default: the
+    graph must have exactly one).
     """
     output_node = next(n for n in prepared.graph.nodes if n.op == "output")
-    (ret_node,) = output_node.args[0]
+    if output_index is None:
+        (ret_node,) = output_node.args[0]
+    else:
+        ret_node = output_node.args[0][output_index]
+    # look through a final layout permute (convert_temporal.py's core)
+    while ret_node.op == "call_function" and ret_node.target is torch.ops.aten.permute.default:
+        ret_node = ret_node.args[0]
     if ret_node.op != "call_module":
         sys.exit("error: --output-scale expected an observer directly at the "
                   "model output and found something else -- the exported "
@@ -437,10 +448,12 @@ def _override_output_scale(prepared, output_scale: float) -> None:
 
 def _quantize_int8(
     model: DenoiseNet, example: torch.Tensor, calib_dataset: str, calib_count: int,
-    output_scale: float | None = None,
+    output_scale: float | None = None, calib_examples: list[torch.Tensor] | None = None,
 ):
     """Run the PT2E static-quantization flow on ResidualDenoiseNet(model),
-    calibrated with real captured data.
+    calibrated with real captured data (or with calib_examples, packed
+    tensors of example's shape, if given -- calib_dataset and calib_count
+    are then ignored).
 
     Returns (quantized, quantizer): the quantized GraphModule -- which
     litert_torch.convert accepts just like any other nn.Module -- and the
@@ -471,17 +484,18 @@ def _quantize_int8(
     # example is (1, 16, packed_h, packed_w); undo compute_bayer_size's two
     # halvings (sensor -> Bayer-split -> caller's further 2x2 packing) to
     # get back the pre-packing crop size calibration data must match.
-    packed_h, packed_w = example.shape[-2:]
-    new_width, new_height = packed_w * 4, packed_h * 4
-    print(f"  Calibrating int8 ranges from real data under {calib_dataset} "
-          f"(up to {calib_count} images)...")
-    calib_examples = _build_calibration_examples(
-        new_width, new_height, calib_dataset, calib_count,
-    )
+    if calib_examples is None:
+        packed_h, packed_w = example.shape[-2:]
+        new_width, new_height = packed_w * 4, packed_h * 4
+        print(f"  Calibrating int8 ranges from real data under {calib_dataset} "
+              f"(up to {calib_count} images)...")
+        calib_examples = _build_calibration_examples(
+            new_width, new_height, calib_dataset, calib_count,
+        )
     with torch.no_grad():
         for calib in calib_examples:
             prepared(calib)
-    print(f"  Calibrated with {len(calib_examples)} real image(s).")
+    print(f"  Calibrated with {len(calib_examples)} image(s).")
 
     if output_scale is not None:
         _override_output_scale(prepared, output_scale)
