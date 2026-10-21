@@ -73,8 +73,8 @@ HERE = Path(__file__).resolve().parent
 # train_temporal.py settings shared by float training and QAT (the loss and
 # data setup that run_temporal.sh uses)
 STANDARD_TRAIN_ARGS = [
-    "--gain-min", "32", "--gain-max", "128",
-    "--diff-weight", "60", "--temporal-weight", "10",
+    "--gain-min", "32", "--gain-max", "192",
+    "--diff-weight", "100", "--temporal-weight", "10",
     "--seq-len", "15", "--window-stride", "15", "--val-frac", "0.3",
     "--flicker-scale", "4", "--temporal-start", "3",
 ]
@@ -371,12 +371,20 @@ def _fmt(v: float, width: int = 7, prec: int = 2) -> str:
 def _report_table(report: list[tuple[str, dict]], clips: list[str],
                   selected: set[str]) -> list[str]:
     """The concise per-stage PSNR report. Test rows: mean temporal PSNR,
-    SSIM, changed-region PSNR and flicker (processed RGB, as test_temporal.py
-    reports them), averaged over the test clips, plus each clip's PSNR when
+    SSIM, changed-region PSNR, frame 0's PSNR and flicker (processed RGB, as
+    test_temporal.py reports them), averaged over the test clips, plus each clip's PSNR when
     there are several. Conversion rows: closed-loop linear PSNR of PyTorch
     and of the .tflite (convert_temporal.py --verify)."""
     per_clip = len(clips) > 1
-    head = f"{'stage':32s} {'PSNR':>7s} {'SSIM':>7s} {'changed':>7s} {'flicker':>8s}"
+    def metrics(result: dict, output: str) -> str:
+        return (f"{_fmt(_mean(result, output, 'psnr'))} "
+                f"{_fmt(_mean(result, output, 'ssim'), prec=4)} "
+                f"{_fmt(_mean(result, output, 'changed_psnr'))} "
+                f"{_fmt(_mean(result, output, 'frame0_psnr'))} "
+                f"{_fmt(_mean(result, output, 'flicker'), 8, 5)}")
+
+    head = (f"{'stage':32s} {'PSNR':>7s} {'SSIM':>7s} {'changed':>7s} {'frame0':>7s} "
+            f"{'flicker':>8s}")
     if per_clip:
         head += "   per clip PSNR"
     lines = ["Test results (mean over frames, processed RGB):", head, "-" * len(head)]
@@ -389,10 +397,7 @@ def _report_table(report: list[tuple[str, dict]], clips: list[str],
         if not result:
             lines.append(f"{stage:32s} (test failed)")
             continue
-        row = (f"{stage:32s} {_fmt(_mean(result, 'temporal', 'psnr'))} "
-               f"{_fmt(_mean(result, 'temporal', 'ssim'), prec=4)} "
-               f"{_fmt(_mean(result, 'temporal', 'changed_psnr'))} "
-               f"{_fmt(_mean(result, 'temporal', 'flicker'), 8, 5)}")
+        row = f"{stage:32s} {metrics(result, 'temporal')}"
         if per_clip:
             row += "   " + " ".join(_fmt(result[c]["temporal"]["psnr"]).strip() if c in result
                                     else "—" for c in clips)
@@ -404,10 +409,7 @@ def _report_table(report: list[tuple[str, dict]], clips: list[str],
                         ("still_int8", "(still model, sim int8)")):
         still = stills[name]
         if still is not None:
-            lines.append(f"{label:32s} {_fmt(_mean(still, name, 'psnr'))} "
-                         f"{_fmt(_mean(still, name, 'ssim'), prec=4)} "
-                         f"{_fmt(_mean(still, name, 'changed_psnr'))} "
-                         f"{_fmt(_mean(still, name, 'flicker'), 8, 5)}")
+            lines.append(f"{label:32s} {metrics(still, name)}")
     if selected:
         lines.append("* = selected (best of its stage)")
 

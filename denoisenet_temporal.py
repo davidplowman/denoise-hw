@@ -13,6 +13,14 @@ Optional extras (see DenoiseNet): blending the output with the previous one
 through a learned per-pixel factor, learned hidden state channels carried
 from frame to frame (optionally with a gated update), and not feeding the
 previous output back in at all.
+
+The network works on square-rooted pixel values (see to_net): forward()
+takes and returns linear images, but square-roots its inputs first, does
+everything (network, residual add, clamp, blend) in that space and squares
+the result. This spends int8's levels more evenly in perceptual terms --
+finer in the darks, coarser in the highlights. On the device the host does
+the same: a sqrt lookup on the input, keeping prev in sqrt space, and
+squaring only the output it passes on.
 """
 
 import math
@@ -20,6 +28,41 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+# Recorded in every checkpoint (see check_checkpoint), so models trained on
+# linear pixel values, before the sqrt transform, can't be loaded by mistake.
+INPUT_TRANSFORM = "sqrt"
+
+_SQRT_EPS = 1e-6
+
+
+def to_net(x: torch.Tensor) -> torch.Tensor:
+    """Linear [0, 1] pixel values -> the network's (square-rooted) space,
+    also [0, 1].
+
+    Below _SQRT_EPS (under 0.07 of a 16-bit level) it's a straight line to
+    (0, 0) instead, to keep the gradient finite there; so it matches a plain
+    sqrt on every raw pixel value, 0 included, and from_net(0) round-trips
+    exactly.
+    """
+    root = torch.sqrt(torch.clamp(x, min=_SQRT_EPS))
+    return torch.where(x >= _SQRT_EPS, root, torch.clamp(x, min=0.0) / math.sqrt(_SQRT_EPS))
+
+
+def from_net(y: torch.Tensor) -> torch.Tensor:
+    """Inverse of to_net: the network's space -> linear pixel values."""
+    return y * y
+
+
+def check_checkpoint(ckpt, path: str = "checkpoint") -> None:
+    """Raise if ckpt (a loaded checkpoint) wasn't trained with this
+    module's INPUT_TRANSFORM."""
+    found = ckpt.get("input_transform") if isinstance(ckpt, dict) else None
+    if found != INPUT_TRANSFORM:
+        raise ValueError(
+            f"{path} was trained with input transform {found or 'none (linear)'}, but "
+            f"denoisenet_temporal.py now uses {INPUT_TRANSFORM!r}: retrain it")
 
 
 def space_to_depth(x: torch.Tensor, r: int) -> torch.Tensor:
@@ -146,9 +189,12 @@ class DenoiseNet(nn.Module):
       h:    the previous frame's hidden state, (B, state_ch, H/4, W/4) in
             [0, 1], or None on the first frame.
     The Bayer split, packing and white_level normalisation are done by the
-    caller -- none of it is part of this model. The network's input is the
-    concatenation [x, prev (if feed_image), h (if state_ch)], with zeros
-    standing in for prev and h on the first frame.
+    caller -- none of it is part of this model. x, prev and out are linear;
+    forward() maps x and prev to_net (sqrt) first, and everything below --
+    the network, s and the blend -- happens in that space, out being mapped
+    back with from_net. The network's input is the concatenation [x, prev
+    (if feed_image), h (if state_ch)], with zeros standing in for prev and h
+    on the first frame.
 
     It returns (out, h_new):
       out:   (B, 16, H/4, W/4) -- denoised, still packed. The candidate
@@ -267,9 +313,12 @@ class DenoiseNet(nn.Module):
     ):
         """See the class docstring. With return_aux, also returns a dict of
         the intermediate maps ("alpha", "z") the model computed, for display,
-        and (with blend_output) the unblended "candidate" s, for its loss."""
+        and (with blend_output) the unblended "candidate" s (linear, as out),
+        for its loss."""
         if self.state_ch and h is None:
             h = x.new_zeros(x.shape[0], self.state_ch, *x.shape[2:])
+        x = to_net(x)
+        prev = to_net(prev) if prev is not None else None
         parts = [x]
         if self.feed_image:
             parts.append(prev if prev is not None else torch.zeros_like(x))
@@ -282,11 +331,12 @@ class DenoiseNet(nn.Module):
         # convex combination of in-range values, so the output stays in range
         out = torch.clamp(x + self.out(feat), 0.0, 1.0)
         if self.blend_output:
-            aux["candidate"] = out
+            aux["candidate"] = from_net(out)
         if self.blend_output and prev is not None:
             alpha = torch.sigmoid(self.alpha(feat))
             out = prev + alpha * (out - prev)
             aux["alpha"] = alpha
+        out = from_net(out)
 
         h_new = None
         if self.state_ch:
@@ -303,10 +353,12 @@ class DenoiseNet(nn.Module):
     def core(self, x: torch.Tensor, prev: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """The exportable part of a feed_image + blend_output model (no
         hidden state): returns (residual, alpha_logit), (B, 16, H/4, W/4) and
-        (B, 1, H/4, W/4). The caller completes forward() itself, in float:
-        s = clamp(x + residual, 0, 1), then on every frame but the first
-        (where prev is zeros and out = s), out = prev + sigmoid(alpha_logit)
-        * (s - prev)."""
+        (B, 1, H/4, W/4). x and prev are in the network's space (to_net of
+        the linear images; prev is zeros on the first frame). The caller
+        completes forward() itself, in float and in that same space: s =
+        clamp(x + residual, 0, 1), then on every frame but the first (where
+        out = s), out = prev + sigmoid(alpha_logit) * (s - prev), keeping out
+        as the next prev and passing on from_net(out)."""
         assert self.feed_image and self.blend_output and not self.state_ch, \
             "core() needs a feed_image + blend_output model with no hidden state"
         feat = self.features(torch.cat([x, prev], dim=1))
@@ -316,7 +368,8 @@ class DenoiseNet(nn.Module):
 class TemporalCoreNet(nn.Module):
     """Wraps a DenoiseNet to export just its core (see DenoiseNet.core):
     (x, prev) -> (residual, alpha_logit), with the skip add, clamp and blend
-    left to the caller, in float.
+    left to the caller, in float. x and prev are in the network's space (see
+    to_net), as for DenoiseNet.core.
 
     Its inputs and outputs are channels-last (NHWC), as the exports' are:
     x and prev are concatenated on the channel axis before a single

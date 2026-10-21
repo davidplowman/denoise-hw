@@ -48,7 +48,7 @@ from skimage.metrics import structural_similarity as ssim
 
 import synthetic_noise
 from dataset_temporal import frame_paths
-from denoisenet_temporal import DenoiseNet, depth_to_space, space_to_depth
+from denoisenet_temporal import DenoiseNet, check_checkpoint, depth_to_space, space_to_depth
 from dng import DNG
 from network import DenoiseNet as StillDenoiseNet
 from train_temporal import _smooth, _to_wb
@@ -83,6 +83,8 @@ def _save_png(rgb: np.ndarray, path: Path) -> None:
 
 def _load_model(checkpoint: str, model_cls: type = DenoiseNet) -> torch.nn.Module:
     ckpt = torch.load(checkpoint, map_location="cpu")
+    if model_cls is DenoiseNet:
+        check_checkpoint(ckpt, checkpoint)
     if isinstance(ckpt, dict) and "state_dict" in ckpt:
         extra = {}
         if model_cls is DenoiseNet:
@@ -160,7 +162,8 @@ def main() -> None:
                          help="with a blended-output model, write <N>_alpha.png for each frame")
     parser.add_argument("--summary-json", type=Path, default=None, metavar="PATH",
                          help="also write the end-of-run means (per output: PSNR, SSIM, "
-                              "changed-region PSNR, flicker) to this JSON file")
+                              "changed-region PSNR, flicker), and frame 0's PSNR, to this "
+                              "JSON file")
     parser.add_argument("--save-state", action="store_true",
                          help="with a hidden-state model, write <N>_state<C>.png for each "
                               "frame and state channel (and print the gate's mean if gated)")
@@ -351,7 +354,8 @@ def main() -> None:
     for (name, ref_name), vals in scores.items():
         p, s = np.mean(vals, axis=0)
         print(f"  PSNR {p:8.3f}  SSIM {s:8.4f}  ({name} vs {ref_name})")
-        summary.setdefault(name, {}).update(psnr=float(p), ssim=float(s))
+        summary.setdefault(name, {}).update(psnr=float(p), ssim=float(s),
+                                            frame0_psnr=float(vals[0][0]))
 
     if args.change_threshold is not None and changed_pixels[1]:
         print(f"\nChanged regions (threshold {args.change_threshold}, "

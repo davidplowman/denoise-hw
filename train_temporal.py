@@ -17,7 +17,9 @@ from tqdm import tqdm
 
 from dataset_temporal import load_datasets, worker_init_fn
 import qat_temporal
-from denoisenet_temporal import DenoiseNet, depth_to_space, space_to_depth
+from denoisenet_temporal import (
+    INPUT_TRANSFORM, DenoiseNet, check_checkpoint, depth_to_space, space_to_depth,
+)
 
 
 def _receptive_field(model: DenoiseNet, h: int = 128) -> int:
@@ -393,6 +395,7 @@ def main() -> None:
     ckpt_cfg = {}
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device)
+        check_checkpoint(ckpt, args.resume)
         if isinstance(ckpt, dict) and "state_dict" in ckpt:
             if args.ch is None:
                 args.ch = ckpt.get("ch")
@@ -587,6 +590,7 @@ def main() -> None:
                  "blend_output": model.blend_output, "state_ch": model.state_ch,
                  "state_gated": model.state_gated, "feed_image": model.feed_image,
                  "gate_clamp": model.gate_clamp,
+                 "input_transform": INPUT_TRANSFORM,
                  # a QAT model's float weights, plus its QAT state
                  **(eval_model.checkpoint_entries() if args.qat else {})},
                 args.checkpoint_out,

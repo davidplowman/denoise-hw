@@ -5,18 +5,21 @@ Only feed_image + blend_output models without hidden state are supported.
 Just the network's core is exported (see DenoiseNet.core), for both fp32 and
 int8, so the two share one interface:
 
-    inputs:  x     (1, H/4, W/4, 16)  the noisy frame, packed and normalised
-             prev  (1, H/4, W/4, 16)  the previous output (zeros on frame 0)
+    inputs:  x     (1, H/4, W/4, 16)  sqrt of the noisy frame, packed and normalised
+             prev  (1, H/4, W/4, 16)  the previous out (zeros on frame 0)
     outputs: r     (1, H/4, W/4, 16)  the residual
              a     (1, H/4, W/4, 1)   the alpha logit
 
-all NHWC. The caller completes each frame in float (see host_step):
+all NHWC, and all in the network's square-rooted space (see
+denoisenet_temporal.to_net). The caller square-roots each noisy frame (a
+lookup on the raw values) and completes the frame in float (see host_step):
 
     s   = clamp(x + r, 0, 1)
     out = s                                  on the first frame
     out = prev + sigmoid(a) * (s - prev)     on every later frame
 
-and keeps out, in float, as the next frame's prev. Keeping the blend and the
+keeping out, in float and still square-rooted, as the next frame's prev,
+and passing on out * out, the linear denoised frame. Keeping the blend and the
 fed-back image out of the network matters most for int8: in static areas
 alpha is small and the output is mostly prev, so an int8 output would get
 stuck on 8-bit levels, with rounding errors compounding frame after frame.
@@ -57,7 +60,7 @@ from convert import (
 )
 import qat_temporal
 from dataset_temporal import frame_paths
-from denoisenet_temporal import DenoiseNet, TemporalCoreNet
+from denoisenet_temporal import DenoiseNet, TemporalCoreNet, from_net, to_net
 from dng import DNG
 from test_temporal import _load_model, _pack
 
@@ -120,6 +123,8 @@ def host_step(x: np.ndarray, r: np.ndarray, alpha_logit: np.ndarray,
     """Complete one frame from the core's outputs, in float -- the reference
     for what the device's own code must do. x, r: (16, h, w); alpha_logit:
     (1, h, w); prev: the previous frame's result, or None on the first frame.
+    x, prev and the result are all in the network's (sqrt) space; the linear
+    output is the result squared.
     """
     s = np.clip(x + r, 0.0, 1.0)
     if prev is None:
@@ -158,14 +163,16 @@ def _calibration_pairs(model: DenoiseNet, args: argparse.Namespace,
                        width: int, height: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
     """(x, prev) pairs from running the float model closed-loop over the
     calibration clips, so prev is the model's own output; frame 0's prev is
-    zeros, as on the device."""
+    zeros, as on the device. Both are in the network's (sqrt) space, as the
+    core sees them."""
     pairs = []
     for clip in args.calib_clips:
         for gain in args.calib_gains:
             prev = None
             for x, _ in _clip_frames(Path(args.dataset) / clip, gain, args.calib_frames,
                                      args.seed, width, height):
-                pairs.append((x, prev if prev is not None else torch.zeros_like(x)))
+                pairs.append((to_net(x), to_net(prev) if prev is not None
+                              else torch.zeros_like(x)))
                 with torch.no_grad():
                     prev, _ = model(x, prev)
     return pairs
@@ -316,7 +323,8 @@ def verify(model: DenoiseNet | qat_temporal.QATTemporalNet, tflite_path: Path, q
 
     Every frame also gets a single-step check: the export and the PyTorch
     core are given the same (x, prev) -- PyTorch's own -- and their r and a
-    compared directly.
+    compared directly. The export side works in the network's (sqrt) space
+    throughout, as the device will; PSNRs are of the linear outputs.
     """
     lite = LiteCore(tflite_path)
     core = model.core_nchw if isinstance(model, qat_temporal.QATTemporalNet) else model.core
@@ -329,12 +337,12 @@ def verify(model: DenoiseNet | qat_temporal.QATTemporalNet, tflite_path: Path, q
     frames = _clip_frames(Path(args.dataset) / args.verify_clip, args.verify_gain,
                           args.verify_frames, args.seed, width, height)
     for t, (x, gt) in enumerate(frames):
-        x_np, gt_np = x[0].numpy(), gt[0].numpy()
-        prev_in = prev_pt if prev_pt is not None else torch.zeros_like(x)
+        x_np, gt_np = to_net(x)[0].numpy(), gt[0].numpy()
+        prev_in = to_net(prev_pt) if prev_pt is not None else torch.zeros_like(x)
 
         # single step, on PyTorch's own (x, prev)
         with torch.no_grad():
-            r_ref, a_ref = (v[0].numpy() for v in core(x, prev_in))
+            r_ref, a_ref = (v[0].numpy() for v in core(to_net(x), prev_in))
         r_lt, a_lt = lite(x_np, prev_in[0].numpy())
         max_dr = max(max_dr, float(np.abs(r_lt - r_ref).max()))
         max_da = max(max_da, float(np.abs(a_lt - a_ref).max()))
@@ -355,10 +363,10 @@ def verify(model: DenoiseNet | qat_temporal.QATTemporalNet, tflite_path: Path, q
             r_lt, a_lt = lite(x_np, prev_lt)
         prev_lt = host_step(x_np, r_lt, a_lt, prev_lt)
 
-        out_pt = prev_pt[0].numpy()
+        out_pt, out_lt = prev_pt[0].numpy(), from_net(prev_lt)
         psnr_pt.append(_psnr(out_pt, gt_np))
-        psnr_lt.append(_psnr(prev_lt, gt_np))
-        gaps.append(float(np.abs(prev_lt - out_pt).mean()))
+        psnr_lt.append(_psnr(out_lt, gt_np))
+        gaps.append(float(np.abs(out_lt - out_pt).mean()))
         print(f"  {t:5d}  {psnr_pt[-1]:10.3f}  {psnr_lt[-1]:10.3f}  {gaps[-1]:11.3g}")
 
     print(f"  mean PSNR: torch {np.mean(psnr_pt):.3f} dB, lite {np.mean(psnr_lt):.3f} dB "

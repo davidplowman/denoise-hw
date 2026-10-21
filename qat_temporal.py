@@ -4,10 +4,10 @@ Only feed_image + blend_output models without hidden state are supported --
 the ones convert_temporal.py exports. Their core (DenoiseNet.core: (x, prev)
 -> (residual, alpha_logit)) is run with simulated int8 (PT2E fake-quantise
 modules, set up exactly as for the int8 export), and the rest of each frame
--- s = clamp(x + residual, 0, 1) and the blend with prev -- is done in
-float, as the device will. QATTemporalNet wraps this behind DenoiseNet's own
-forward() signature, so train_temporal.py's training and validation code
-runs it unchanged.
+-- the sqrt transform, s = clamp(x + residual, 0, 1), the blend with prev
+and squaring the result -- is done in float, as the device will.
+QATTemporalNet wraps this behind DenoiseNet's own forward() signature, so
+train_temporal.py's training and validation code runs it unchanged.
 
 A QAT checkpoint holds both the core's full QAT state ("qat_state_dict":
 weights plus every fake-quantise module's ranges) and the plain float
@@ -26,7 +26,9 @@ from convert import (
     _INPUT_QUANT_SCALE, _INPUT_QUANT_ZERO_POINT, _make_fixed_input_quantizer,
     _patch_add_annotator,
 )
-from denoisenet_temporal import DenoiseNet, TemporalCoreNet, set_clamp_in_graph
+from denoisenet_temporal import (
+    DenoiseNet, TemporalCoreNet, from_net, set_clamp_in_graph, to_net,
+)
 
 
 def check_model(model: DenoiseNet) -> None:
@@ -167,9 +169,11 @@ def freeze_ranges(module: nn.Module) -> None:
 class QATTemporalNet(nn.Module):
     """A QAT core behind DenoiseNet's forward() signature: (x, prev, h,
     return_aux) -> (out, None[, aux]), aux holding "candidate" and (but on
-    the first frame, prev None) "alpha". Everything outside the core is
-    float, as on the device (see convert_temporal.host_step). It also
-    carries the float model's config attributes, for checkpointing."""
+    the first frame, prev None) "alpha". As DenoiseNet.forward, x, prev, out
+    and the candidate are linear, the core working on their to_net (sqrt)
+    versions. Everything outside the core is float, as on the device (see
+    convert_temporal.host_step). It also carries the float model's config
+    attributes, for checkpointing."""
 
     _CONFIG = ("ch", "scaling_factors", "num_encoders", "blend_output",
                "state_ch", "state_gated", "feed_image", "gate_clamp")
@@ -182,20 +186,24 @@ class QATTemporalNet(nn.Module):
 
     def forward(self, x: torch.Tensor, prev: torch.Tensor | None = None,
                 h: torch.Tensor | None = None, return_aux: bool = False):
+        x = to_net(x)
+        prev = to_net(prev) if prev is not None else None
         r, a = self.core_nchw(x, prev if prev is not None else torch.zeros_like(x))
         s = torch.clamp(x + r, 0.0, 1.0)
-        aux = {"candidate": s}
+        aux = {"candidate": from_net(s)}
         out = s
         if prev is not None:
             alpha = torch.sigmoid(a)
             out = prev + alpha * (s - prev)
             aux["alpha"] = alpha
+        out = from_net(out)
         if return_aux:
             return out, None, aux
         return out, None
 
     def core_nchw(self, x: torch.Tensor, prev: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """The (channels-last) core, on and returning NCHW tensors."""
+        """The (channels-last) core, on and returning NCHW tensors (x and
+        prev in the network's space, as DenoiseNet.core)."""
         r, a = self.core(x.permute(0, 2, 3, 1), prev.permute(0, 2, 3, 1))
         return r.permute(0, 3, 1, 2), a.permute(0, 3, 1, 2)
 
