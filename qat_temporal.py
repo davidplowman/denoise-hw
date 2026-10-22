@@ -176,7 +176,7 @@ class QATTemporalNet(nn.Module):
     attributes, for checkpointing."""
 
     _CONFIG = ("ch", "scaling_factors", "num_encoders", "blend_output",
-               "state_ch", "state_gated", "feed_image", "gate_clamp")
+               "state_ch", "state_gated", "feed_image", "gate_clamp", "wide_low")
 
     def __init__(self, core: torch.fx.GraphModule, model: DenoiseNet) -> None:
         super().__init__()

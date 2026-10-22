@@ -330,6 +330,8 @@ def main() -> None:
     parser.add_argument("--blend-output", action="store_true", default=None,
                          help="output prev + alpha * (candidate - prev), with a learned "
                               "per-pixel alpha")
+    parser.add_argument("--wide-low",     action="store_true", default=None,
+                         help="2x the channels at every level below full resolution")
     parser.add_argument("--state-ch",     type=int,   default=None,
                          help="number of hidden state channels carried between frames "
                               "(0 = none)")
@@ -408,7 +410,8 @@ def main() -> None:
         else:
             state_dict = ckpt
     for key, default in (("blend_output", False), ("state_ch", 0),
-                         ("state_gated", False), ("feed_image", True), ("gate_clamp", None)):
+                         ("state_gated", False), ("feed_image", True), ("gate_clamp", None),
+                         ("wide_low", False)):
         if getattr(args, key) is None:
             setattr(args, key, ckpt_cfg.get(key, default))
     if args.state_ch < 0:
@@ -432,7 +435,7 @@ def main() -> None:
         return DenoiseNet(ch=args.ch, scaling_factors=args.scaling, num_encoders=args.encoders,
                           state_ch=args.state_ch, feed_image=args.feed_image,
                           state_gated=args.state_gated, blend_output=args.blend_output,
-                          gate_clamp=args.gate_clamp).to(device)
+                          gate_clamp=args.gate_clamp, wide_low=args.wide_low).to(device)
 
     model = make_model()
     if state_dict is not None:
@@ -450,7 +453,8 @@ def main() -> None:
     rf = _receptive_field(model)
     print(f"Model parameters: {n_params:,}  MACs/pixel: {macs:,}  RF: {rf}×{rf}px")
     print(f"Blend output: {args.blend_output}  Feed image: {args.feed_image}  "
-          f"State channels: {args.state_ch}" + ("  (gated)" if args.state_gated else ""))
+          f"State channels: {args.state_ch}" + ("  (gated)" if args.state_gated else "")
+          + f"  Wide low-res levels: {args.wide_low}")
     print(f"Gain min: {args.gain_min} max: {args.gain_max}")
     print(f"GT-difference loss weight: {args.diff_weight}  "
           f"(blur {args.diff_blur}, dilate {args.diff_dilate})")
@@ -589,7 +593,7 @@ def main() -> None:
                  "candidate_weight": args.candidate_weight,
                  "blend_output": model.blend_output, "state_ch": model.state_ch,
                  "state_gated": model.state_gated, "feed_image": model.feed_image,
-                 "gate_clamp": model.gate_clamp,
+                 "gate_clamp": model.gate_clamp, "wide_low": model.wide_low,
                  "input_transform": INPUT_TRANSFORM,
                  # a QAT model's float weights, plus its QAT state
                  **(eval_model.checkpoint_entries() if args.qat else {})},

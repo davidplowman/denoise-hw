@@ -18,7 +18,9 @@ for one run to its own directory, experiments/<name>/:
 Stages:
   1. Float training: --loops runs of train_temporal.py with the standard
      settings (blend output, diff 50, temporal 10, candidate 0.1 (--cand),
-     gate clamp 8, gains 32-128, 15-frame sequences, ...).
+     gate clamp 8, gains 32-128, 15-frame sequences, ...). --wide-low gives
+     the levels below full resolution 2x --ch channels (a "w" in the run
+     name).
   2. Each loop's checkpoint is tested on --test-clips (test_temporal.py, gain
      64, seed 0, so every loop sees identical noise).
   3. The loop with the best mean temporal PSNR over the test clips is
@@ -100,6 +102,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help='space-separated scaling factors (default: "%(default)s")')
     parser.add_argument("--encoders", default="1 1",
                         help='space-separated encoder counts per level (default: "%(default)s")')
+    parser.add_argument("--wide-low", action="store_true",
+                        help="2x --ch channels at every level below full resolution")
     parser.add_argument("--gate-clamp", type=float, default=8.0,
                         help="clamp the gates' pre-sigmoid values to +-G, for int8 (0 = "
                              "off; with --float-checkpoint, 0 keeps the model's own) "
@@ -208,6 +212,8 @@ class Pipeline:
         out = self.dir / f"loop{loop}" / "model.pth"
         extra = ["--ch", str(a.ch), "--scaling", a.scaling, "--encoders", *a.encoders.split(),
                  "--blend-output", "--lr", str(a.lr), "--epochs", str(a.epochs)]
+        if a.wide_low:
+            extra += ["--wide-low"]
         if a.gate_clamp:
             extra += ["--gate-clamp", str(a.gate_clamp)]
         ok = self.train(out, extra, f"Float training, loop {loop}/{a.loops}")
@@ -457,7 +463,7 @@ def main(argv: list[str] | None = None) -> int:
         name = f"{(args.qat_checkpoint or args.float_checkpoint).stem}_{time.strftime('%Y%m%d-%H%M')}"
     else:
         name = (f"{args.ch}_{args.scaling.replace(' ', '')}e{args.encoders.replace(' ', '')}"
-                f"_c{args.cand:g}{f'_gc{args.gate_clamp:g}' if args.gate_clamp else ''}"
+                f"{'w' if args.wide_low else ''}_c{args.cand:g}{f'_gc{args.gate_clamp:g}' if args.gate_clamp else ''}"
                 f"_{time.strftime('%Y%m%d-%H%M')}")
     run_dir = (HERE / args.out_root / name) if not args.out_root.is_absolute() else args.out_root / name
     if run_dir.exists() and not args.force:

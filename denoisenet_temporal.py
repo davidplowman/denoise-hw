@@ -219,6 +219,13 @@ class DenoiseNet(nn.Module):
     via a non-overlapping NxN conv; any N works, not just 2). There is
     always one more encoder level than there are scaling factors -- the
     last encoder level (the bottleneck) has no downsample after it.
+
+    Every level has ch channels, except that with wide_low each level below
+    full resolution (the packed H/4) has 2*ch: the downsample conv into the
+    first such level doubles them, and where the decoder comes back up to
+    full resolution, a 1x1 conv (in ups, run before the upsample) halves
+    them again for the skip add. The full-resolution layers and the heads
+    keep ch.
     """
 
     _SCALING_FACTORS = [2]
@@ -235,6 +242,7 @@ class DenoiseNet(nn.Module):
         state_gated: bool = False,
         blend_output: bool = False,
         gate_clamp: float | None = None,
+        wide_low: bool = False,
     ) -> None:
         super().__init__()
         nf = ch if ch is not None else self._BASE_CH
@@ -252,20 +260,35 @@ class DenoiseNet(nn.Module):
         self.state_gated = state_gated
         self.blend_output = blend_output
         self.gate_clamp = gate_clamp
+        self.wide_low = wide_low
         self.in_ch = 16 + (16 if feed_image else 0) + state_ch
+
+        # channels per encoder level: 2*nf below full resolution with wide_low
+        level_ch = [nf if math.prod(sf[:i]) == 1 or not wide_low else 2 * nf
+                    for i in range(len(num_encoders))]
 
         self.inp = nn.Conv2d(self.in_ch, nf, 1)
 
         self.enc_blocks = nn.ModuleList([
-            nn.Sequential(*[DenoiseBlock(nf, gate_clamp) for _ in range(n)]) for n in num_encoders
+            nn.Sequential(*[DenoiseBlock(c, gate_clamp) for _ in range(n)])
+            for c, n in zip(level_ch, num_encoders)
         ])
         self.downs = nn.ModuleList([
-            nn.Conv2d(nf, nf, s, stride=s) if s > 1 else nn.Identity()
-            for s in sf
+            nn.Conv2d(level_ch[i], level_ch[i + 1], s, stride=s) if s > 1 else nn.Identity()
+            for i, s in enumerate(sf)
         ])
 
+        # decoder j comes up from level n_dec - j to level n_dec - j - 1; ups[j]
+        # matches the channels to that level's skip (an Identity, with no
+        # weights, unless wide_low changes them)
         n_dec = len(sf)
-        self.dec_blocks = nn.ModuleList([DenoiseBlock(nf, gate_clamp) for _ in range(n_dec)])
+        self.ups = nn.ModuleList([
+            nn.Conv2d(level_ch[n_dec - j], level_ch[n_dec - j - 1], 1)
+            if level_ch[n_dec - j] != level_ch[n_dec - j - 1] else nn.Identity()
+            for j in range(n_dec)
+        ])
+        self.dec_blocks = nn.ModuleList([DenoiseBlock(level_ch[n_dec - j - 1], gate_clamp)
+                                         for j in range(n_dec)])
 
         self.out = nn.Conv2d(nf, 16, 3, padding=1)
 
@@ -299,7 +322,7 @@ class DenoiseNet(nn.Module):
 
         for j, dec in enumerate(self.dec_blocks):
             skip = skips.pop(0)
-            up = F.interpolate(feat, size=skip.shape[-2:], mode='nearest')
+            up = F.interpolate(self.ups[j](feat), size=skip.shape[-2:], mode='nearest')
             feat = dec(skip + up)
 
         return feat

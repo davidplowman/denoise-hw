@@ -89,7 +89,7 @@ def _load_model(checkpoint: str, model_cls: type = DenoiseNet) -> torch.nn.Modul
         extra = {}
         if model_cls is DenoiseNet:
             extra = {k: ckpt[k] for k in ("state_ch", "feed_image", "state_gated", "blend_output",
-                                          "gate_clamp")
+                                          "gate_clamp", "wide_low")
                      if k in ckpt}
         model = model_cls(ch=ckpt.get("ch"), scaling_factors=ckpt.get("scaling_factors"),
                            num_encoders=ckpt.get("num_encoders"), **extra)
